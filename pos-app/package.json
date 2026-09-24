@@ -1,0 +1,42 @@
+{
+  "name": "pos-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "next typegen && tsc --noEmit",
+    "check:secrets": "node scripts/check-bundle-secrets.mjs",
+    "db:bundle": "node scripts/bundle-migrations.mjs",
+    "db:bundle:check": "node scripts/bundle-migrations.mjs --check",
+    "test:db": "bash scripts/test-db.sh",
+    "verify": "npm run typecheck && npm run lint && npm run db:bundle:check && npm run build && npm run check:secrets"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.117.1",
+    "jsbarcode": "^3.12.3",
+    "lucide-react": "^1.48.0",
+    "next": "16.3.6",
+    "qrcode": "^1.5.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20.9"
+  }
+}

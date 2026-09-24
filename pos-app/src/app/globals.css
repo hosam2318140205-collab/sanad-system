@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-arabic), system-ui, "Segoe UI", Tahoma, sans-serif;
+  --color-brand-50: #ecfdf5;
+  --color-brand-100: #d1fae5;
+  --color-brand-200: #a7f3d0;
+  --color-brand-500: #10b981;
+  --color-brand-600: #059669;
+  --color-brand-700: #047857;
+  --color-brand-800: #065f46;
+  --color-brand-900: #064e3b;
+}
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  background: #f4f6f8;
+  color: #0f172a;
+}
+
+body {
+  font-feature-settings: "tnum";
+}
+
+/* أرقام لاتينية واضحة داخل الواجهة العربية */
+.ltr-nums {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+/* ---------- الطباعة ---------- */
+.print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    margin: 0;
+  }
+  html,
+  body {
+    background: #fff !important;
+  }
+  body > *:not(.print-area) {
+    display: none !important;
+  }
+  .print-area {
+    display: block !important;
+  }
+}
+
+/* فاتورة حرارية 80mm */
+.receipt {
+  width: 72mm;
+  padding: 3mm 4mm;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #000;
+  background: #fff;
+}
+.receipt table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.receipt .dashed {
+  border-top: 1px dashed #000;
+  margin: 6px 0;
+}
+.receipt.w58 {
+  width: 50mm;
+  font-size: 10px;
+}
