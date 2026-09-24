@@ -6,7 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "next typegen && tsc --noEmit",
+    "check:secrets": "node scripts/check-bundle-secrets.mjs",
+    "db:bundle": "node scripts/bundle-migrations.mjs",
+    "db:bundle:check": "node scripts/bundle-migrations.mjs --check",
+    "test:db": "bash scripts/test-db.sh",
+    "verify": "npm run typecheck && npm run lint && npm run db:bundle:check && npm run build && npm run check:secrets"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
@@ -29,5 +35,8 @@
     "eslint-config-next": "16.3.6",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20.9"
   }
 }

@@ -26,6 +26,11 @@ alter table public.stock_counts enable row level security;
 alter table public.stock_count_items enable row level security;
 alter table public.audit_log enable row level security;
 
+-- صلاحيات صريحة: لا نعتمد على الصلاحيات الافتراضية للمشروع (تختلف بين مشاريع Supabase)
+-- RLS أدناه هي التي تحدد الصفوف المسموحة فعلياً لكل دور
+grant usage on schema public to authenticated;
+grant select, insert, update, delete on all tables in schema public to authenticated;
+
 -- لا شيء للزوار غير المسجلين
 revoke all on all tables in schema public from anon;
 revoke all on all sequences in schema public from anon;

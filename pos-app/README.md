@@ -36,49 +36,41 @@
 
 ## التشغيل
 
-### 1) قاعدة البيانات (Supabase)
-
-1. أنشئ مشروعاً على [supabase.com](https://supabase.com).
-2. نفّذ ملفات `supabase/migrations/` بالترتيب في **SQL Editor**، أو عبر CLI:
-   ```bash
-   supabase link --project-ref <ref>
-   supabase db push
-   ```
-3. (اختياري) بيانات تجريبية: `supabase/seed.sql`.
-4. من **Authentication → Providers → Email** يُفضّل **تعطيل التسجيل العام (Allow new users to sign up)** — المالك ينشئ حسابات الموظفين من صفحة المستخدمين.
-
-### 2) التطبيق
+- **النشر على Production (Supabase + Vercel):** اتبع [`DEPLOYMENT.md`](DEPLOYMENT.md).
+- **التطوير المحلي:**
 
 ```bash
-cp .env.example .env.local   # ضع رابط المشروع والمفاتيح
+cp .env.example .env.local   # رابط مشروع Supabase والمفاتيح
 npm install
 npm run dev                  # http://localhost:3000
 ```
 
-3. أنشئ أول مستخدم من لوحة Supabase (**Authentication → Users → Add user**) — **أول مستخدم يصبح المالك تلقائياً**.
-4. ادخل وأكمل بيانات المتجر من **الإعدادات** (الاسم، الرقم الضريبي، السجل التجاري) لتظهر في الفاتورة ورمز QR.
-
 ### الأوامر
 
 ```bash
-npm run dev     # تطوير
-npm run build   # بناء الإنتاج (يشمل فحص TypeScript)
-npm run lint    # ESLint
-npx tsc --noEmit
+npm run verify     # قبل كل نشر: typecheck + lint + تحقق حزمة الـ migrations + build + فحص الأسرار
+npm run test:db    # اختبارات قاعدة البيانات على PostgreSQL مؤقت (TEST_DATABASE_URL) — يرفض Supabase
+npm run db:bundle  # بعد تعديل أي migration: يعيد توليد supabase/setup/01_all_migrations.sql
 ```
 
 ## البنية
 
 ```
 supabase/
-  migrations/
+  migrations/                المصدر (بالترتيب)
     0001_schema.sql          الجداول، الأدوار، إنشاء الملف الشخصي عند التسجيل
     0002_triggers_audit.sql  حماية المخزون، الرصيد الافتتاحي، سجل التدقيق
-    0003_rls.sql             سياسات RLS + صلاحيات الأعمدة + تخزين الصور
-    0004_functions.sql       complete_sale, process_return, receive_purchase,
-                             adjust_stock, start/apply_stock_count, dashboard_stats, sales_report
-  tests/smoke_test.sql       اختبار شامل للسيناريوهات تحت RLS (على قاعدة اختبار فقط)
-  seed.sql                   بيانات تجريبية
+    0003_rls.sql             صلاحيات صريحة + RLS + صلاحيات الأعمدة + تخزين الصور
+    0004_functions.sql       complete_sale, process_return, receive_purchase, adjust_stock,
+                             start/apply_stock_count, dashboard_stats, sales_report
+    0005_storage_limits.sql  صور فقط، 5MB، داخل مجلد products/
+  setup/                     ما يُنفَّذ في SQL Editor على Production
+    01_all_migrations.sql    كل الـ migrations في ملف واحد (مولَّد — لا يُعدَّل يدوياً)
+    02_demo_data.sql         بيانات تجريبية معلَّمة (DEMO-) — اختياري
+    03_remove_demo_data.sql  حذف البيانات التجريبية فقط
+    04_reset_test_transactions.sql  تصفير فواتير التجربة قبل الافتتاح (يتطلب تأكيداً)
+  tests/                     smoke_test.sql, demo_data_test.sql, supabase_stub.sql
+scripts/                     bundle-migrations, check-bundle-secrets, test-db
 src/
   proxy.ts                   تحديث جلسة Supabase وحماية المسارات (Next 16 proxy)
   lib/                       عملاء Supabase، الأنواع، التنسيق، الضريبة، ZATCA QR، الباركود

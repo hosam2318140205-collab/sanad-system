@@ -23,6 +23,8 @@ function BarcodeSvg({ code }: { code: string }) {
         height: 34,
         fontSize: 11,
         margin: 0,
+        // EAN-13 prints its first digit to the left of the bars; leave room so it isn't clipped
+        marginLeft: 10,
         displayValue: true,
       });
     } catch {
