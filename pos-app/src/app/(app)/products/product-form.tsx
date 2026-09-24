@@ -464,8 +464,72 @@ export function ProductForm({ productId }: { productId: string | null }) {
           <Sparkles className="size-4" /> توليد التركيبات ({Math.max(sizes.length, 1) * Math.max(colors.length, 1)})
         </Button>
 
+        {/* الجوال: بطاقة لكل مقاس/لون بكل الحقول ظاهرة بدون تمرير أفقي */}
         {visibleRows.length > 0 && (
-          <Table className="rounded-lg border border-slate-200">
+          <ul className="space-y-3 md:hidden">
+            {visibleRows.map((r) => {
+              const m = margin(r);
+              return (
+                <li key={r.key} className="rounded-xl border border-slate-200 p-3">
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    {r.color_hex && <span className="size-5 shrink-0 rounded-full border border-slate-300" style={{ background: r.color_hex }} />}
+                    <p className="min-w-0 flex-1 break-words font-semibold">{variantLabel(r.size, r.color) || "بدون مقاس/لون"}</p>
+                    {r.id && <Badge tone={r.stock_qty <= Number(r.low) ? "amber" : "slate"}>مخزون {r.stock_qty}</Badge>}
+                    <label className="flex items-center gap-1 text-xs text-slate-600">
+                      <input type="checkbox" className="size-4 accent-brand-700" checked={r.is_active} onChange={(e) => setRow(r.key, { is_active: e.target.checked })} />
+                      نشط
+                    </label>
+                    {(!r.id || isOwner) && (
+                      <button
+                        className="p-1 text-slate-400 hover:text-red-600"
+                        onClick={() => (r.id ? setRow(r.key, { deleted: true }) : setRows((rs) => rs.filter((x) => x.key !== r.key)))}
+                        aria-label="حذف"
+                      >
+                        <Trash2 className="size-4" />
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+                    <Field label="المقاس">
+                      <Input className="h-9" value={r.size} onChange={(e) => setRow(r.key, { size: e.target.value })} />
+                    </Field>
+                    <Field label="اللون">
+                      <Input className="h-9" value={r.color} onChange={(e) => setRow(r.key, { color: e.target.value })} />
+                    </Field>
+                    <Field label="سعر خاص">
+                      <Input type="number" inputMode="decimal" step="0.01" className="h-9" placeholder={form.base_price || "-"} value={r.price} onChange={(e) => setRow(r.key, { price: e.target.value })} />
+                    </Field>
+                    <Field label="التكلفة" hint={m !== null ? `هامش ${m.toFixed(0)}%` : undefined}>
+                      <Input type="number" inputMode="decimal" step="0.01" className="h-9" value={r.cost} onChange={(e) => setRow(r.key, { cost: e.target.value })} />
+                    </Field>
+                    {!r.id && (
+                      <Field label="رصيد افتتاحي">
+                        <Input type="number" inputMode="numeric" min={0} className="h-9" value={r.opening} onChange={(e) => setRow(r.key, { opening: e.target.value })} />
+                      </Field>
+                    )}
+                    <Field label="حد التنبيه">
+                      <Input type="number" inputMode="numeric" min={0} className="h-9" value={r.low} onChange={(e) => setRow(r.key, { low: e.target.value })} />
+                    </Field>
+                    <Field label="SKU" className="col-span-2">
+                      <Input dir="ltr" className="h-9" value={r.sku} onChange={(e) => setRow(r.key, { sku: e.target.value })} />
+                    </Field>
+                    <Field label="الباركود" className="col-span-2">
+                      <div className="flex gap-2">
+                        <Input dir="ltr" inputMode="numeric" className="h-9 min-w-0 flex-1" value={r.barcode} onChange={(e) => setRow(r.key, { barcode: e.target.value })} />
+                        <Button type="button" variant="outline" size="sm" className="h-9 shrink-0" onClick={() => setRow(r.key, { barcode: generateEan13() })}>
+                          توليد
+                        </Button>
+                      </div>
+                    </Field>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {visibleRows.length > 0 && (
+          <Table className="hidden rounded-lg border border-slate-200 md:block">
             <thead>
               <tr>
                 <th>المقاس</th>

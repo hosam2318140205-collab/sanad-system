@@ -129,7 +129,7 @@ export function Checkbox({
 
 // ---------------------------------------------------------------- Layout bits
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
-  return <div className={cn("rounded-xl border border-slate-200 bg-white shadow-sm", className)}>{children}</div>;
+  return <div className={cn("min-w-0 rounded-xl border border-slate-200 bg-white shadow-sm", className)}>{children}</div>;
 }
 
 export function PageHeader({
@@ -143,7 +143,7 @@ export function PageHeader({
 }) {
   return (
     <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-      <div>
+      <div className="min-w-0">
         <h1 className="text-xl font-bold text-slate-900 md:text-2xl">{title}</h1>
         {subtitle && <p className="mt-0.5 text-sm text-slate-500">{subtitle}</p>}
       </div>
@@ -216,14 +216,14 @@ export function Stat({
     blue: "bg-sky-100 text-sky-700",
   };
   return (
-    <Card className="p-4">
+    <Card className="p-3 sm:p-4">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="text-sm text-slate-500">{label}</p>
-          <p className="mt-1 truncate text-xl font-bold text-slate-900 md:text-2xl">{value}</p>
+          <p className="text-xs text-slate-500 sm:text-sm">{label}</p>
+          <p className="mt-1 break-words text-lg font-bold leading-snug text-slate-900 tabular-nums sm:text-xl md:text-2xl">{value}</p>
           {hint && <p className="mt-1 text-xs text-slate-500">{hint}</p>}
         </div>
-        {icon && <div className={cn("rounded-lg p-2", tones[tone])}>{icon}</div>}
+        {icon && <div className={cn("hidden shrink-0 rounded-lg p-2 sm:block", tones[tone])}>{icon}</div>}
       </div>
     </Card>
   );

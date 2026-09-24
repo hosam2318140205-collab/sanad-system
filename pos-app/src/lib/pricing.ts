@@ -73,3 +73,27 @@ export function computeTotals(
     lines: out,
   };
 }
+
+export interface SplitPayment {
+  method: string;
+  amount: string;
+}
+
+/**
+ * Keeps split payments summing to what is due after the cashier edits row `edited`.
+ * - Editing any row but the last recalculates the last row (the "remainder" row).
+ * - Editing the last row rebalances the first row, unless the last row is cash:
+ *   cash handed over may exceed what is due and the excess is the customer's change.
+ * Returns a new array; display-only — complete_sale() re-validates on the server.
+ */
+export function balanceSplit<T extends SplitPayment>(rows: T[], edited: number, due: number): T[] {
+  if (rows.length < 2) return rows;
+  const last = rows.length - 1;
+  let target: number;
+  if (edited !== last) target = last;
+  else if (rows[last].method !== "cash") target = 0;
+  else return rows;
+  const others = rows.reduce((s, r, i) => (i === target ? s : s + (Number(r.amount) || 0)), 0);
+  const value = round2(Math.max(due - others, 0));
+  return rows.map((r, i) => (i === target ? { ...r, amount: value.toFixed(2) } : r));
+}

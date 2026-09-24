@@ -25,7 +25,7 @@ import { useSession } from "@/components/session-context";
 import { Badge, Button, Field, Input, Modal, cn, useToast } from "@/components/ui";
 import { fetchCatalog, fetchCategories, normalize } from "@/lib/catalog";
 import { PAYMENT_LABELS, errorMessage, money, round2, variantLabel } from "@/lib/format";
-import { computeTotals } from "@/lib/pricing";
+import { balanceSplit, computeTotals } from "@/lib/pricing";
 import { loadReceipt } from "@/lib/sales";
 import { supabase } from "@/lib/supabase/client";
 import type { CatalogItem, Category, Customer, PaymentMethod, ReturnRecord } from "@/lib/types";
@@ -916,6 +916,14 @@ function PaymentModal({
   const invalid = remaining > 0.001 || nonCash > due + 0.001 || creditTooBig;
 
   const setRow = (i: number, patch: Partial<PaymentRow>) => setRows((r) => r.map((x, idx) => (idx === i ? { ...x, ...patch } : x)));
+  // تعديل مبلغ أي دفعة يعيد حساب المتبقي في الدفعة المقابلة تلقائياً
+  const setAmount = (i: number, amount: string) =>
+    setRows((r) => balanceSplit(r.map((x, idx) => (idx === i ? { ...x, amount } : x)), i, due));
+  const removeRow = (i: number) =>
+    setRows((r) => {
+      const next = r.filter((_, idx) => idx !== i);
+      return next.length > 1 ? balanceSplit(next, 0, due) : next;
+    });
 
   const selectSingle = (method: PaymentRow["method"]) => setRows([{ method, amount: due.toFixed(2), reference: "" }]);
 
@@ -996,11 +1004,12 @@ function PaymentModal({
 
         <div className="space-y-2">
           {rows.map((r, i) => (
-            <div key={i} className="flex items-center gap-2">
+            <div key={i} className="flex flex-wrap items-center gap-2">
               <select
                 value={r.method}
                 onChange={(e) => setRow(i, { method: e.target.value as PaymentRow["method"] })}
-                className="h-11 rounded-lg border border-slate-300 px-2 text-sm"
+                className="h-11 shrink-0 rounded-lg border border-slate-300 px-2 text-sm"
+                aria-label="طريقة الدفع"
               >
                 <option value="cash">نقدي</option>
                 <option value="card">شبكة</option>
@@ -1011,22 +1020,23 @@ function PaymentModal({
                 inputMode="decimal"
                 step="0.01"
                 min={0}
-                className="h-11 flex-1 text-lg font-semibold"
+                className="h-11 w-auto min-w-0 flex-1 text-lg font-semibold"
                 value={r.amount}
                 autoFocus={i === rows.length - 1}
                 onFocus={(e) => e.target.select()}
-                onChange={(e) => setRow(i, { amount: e.target.value })}
+                onChange={(e) => setAmount(i, e.target.value)}
+                aria-label="المبلغ"
               />
               {r.method !== "cash" && (
                 <Input
-                  className="h-11 w-28"
+                  className="order-last h-11 w-full sm:order-none sm:w-28"
                   placeholder="مرجع"
                   value={r.reference}
                   onChange={(e) => setRow(i, { reference: e.target.value })}
                 />
               )}
               {rows.length > 1 && (
-                <button className="p-2 text-slate-400 hover:text-red-600" onClick={() => setRows(rows.filter((_, idx) => idx !== i))} aria-label="حذف">
+                <button className="p-2 text-slate-400 hover:text-red-600" onClick={() => removeRow(i)} aria-label="حذف">
                   <X className="size-4" />
                 </button>
               )}
@@ -1045,7 +1055,7 @@ function PaymentModal({
         {rows.length === 1 && rows[0].method === "cash" && due > 0 && (
           <div className="flex flex-wrap gap-2">
             {quickCash.map((v) => (
-              <Button key={v} variant="outline" size="sm" onClick={() => setRow(0, { amount: v.toFixed(2) })}>
+              <Button key={v} variant="outline" size="sm" onClick={() => setAmount(0, v.toFixed(2))}>
                 {v.toFixed(0)}
               </Button>
             ))}

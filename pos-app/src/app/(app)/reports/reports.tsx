@@ -125,10 +125,10 @@ export function Reports() {
             {p.label}
           </button>
         ))}
-        <div className="ms-auto flex items-center gap-2">
-          <Input type="date" className="w-auto" value={from} onChange={(e) => setFrom(e.target.value)} />
+        <div className="flex w-full items-center gap-2 sm:ms-auto sm:w-auto">
+          <Input type="date" className="min-w-0 flex-1 sm:w-auto sm:flex-none" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="من تاريخ" />
           <span className="text-slate-400">—</span>
-          <Input type="date" className="w-auto" value={to} onChange={(e) => setTo(e.target.value)} />
+          <Input type="date" className="min-w-0 flex-1 sm:w-auto sm:flex-none" value={to} onChange={(e) => setTo(e.target.value)} aria-label="إلى تاريخ" />
         </div>
       </Card>
 
