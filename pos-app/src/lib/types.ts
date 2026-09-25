@@ -33,6 +33,7 @@ export interface StoreSettings {
   max_cashier_discount_pct: number;
   return_days: number;
   currency: string;
+  require_shift: boolean;
 }
 
 export interface Category {
@@ -229,4 +230,62 @@ export interface CatalogItem {
   color_hex: string | null;
   price: number;
   stock_qty: number;
+}
+
+export interface ShiftNumbers {
+  opening_cash: number;
+  sales_count: number;
+  returns_count: number;
+  total_sales: number;
+  // below: managers always; the cashier only after the shift is closed
+  cash_sales?: number;
+  card_sales?: number;
+  transfer_sales?: number;
+  exchange_credit?: number;
+  cash_refunds?: number;
+  card_refunds?: number;
+  transfer_refunds?: number;
+  exchange_returns?: number;
+  cash_in?: number;
+  cash_out?: number;
+  expected_cash?: number;
+}
+
+export interface ShiftSummary {
+  id: string;
+  shift_no: string;
+  status: "open" | "closed";
+  cashier_id: string;
+  cashier_name: string | null;
+  opened_at: string;
+  closed_at: string | null;
+  closed_by_name: string | null;
+  counted_cash: number | null;
+  cash_difference: number | null;
+  opening_notes: string | null;
+  closing_notes: string | null;
+  numbers: ShiftNumbers;
+  movements: { type: "in" | "out"; amount: number; reason: string; created_at: string }[];
+}
+
+export interface ShiftListRow {
+  id: string;
+  shift_no: string;
+  status: "open" | "closed";
+  cashier_name: string | null;
+  is_mine: boolean;
+  opened_at: string;
+  closed_at: string | null;
+  opening_cash: number;
+  total_sales: number;
+  expected_cash: number | null;
+  counted_cash: number | null;
+  cash_difference: number | null;
+}
+
+export interface OpenShift {
+  id: string;
+  shift_no: string;
+  opened_at: string;
+  opening_cash: number;
 }

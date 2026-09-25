@@ -19,6 +19,7 @@ import {
   UserCog,
   Users,
   PackagePlus,
+  Wallet,
   X,
 } from "lucide-react";
 import Link from "next/link";
@@ -45,6 +46,7 @@ const NAV: NavItem[] = [
   { href: "/pos", label: "نقطة البيع", icon: ShoppingCart, roles: ALL },
   { href: "/sales", label: "الفواتير", icon: FileText, roles: ALL },
   { href: "/returns", label: "المرتجعات والاستبدال", icon: Undo2, roles: ALL },
+  { href: "/shifts", label: "الورديات", icon: Wallet, roles: ALL },
   { href: "/products", label: "المنتجات", icon: Shirt, roles: M },
   { href: "/inventory", label: "المخزون", icon: Boxes, roles: M },
   { href: "/inventory/counts", label: "الجرد", icon: ClipboardCheck, roles: ALL },
