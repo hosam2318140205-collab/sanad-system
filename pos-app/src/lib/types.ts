@@ -289,3 +289,36 @@ export interface OpenShift {
   opened_at: string;
   opening_cash: number;
 }
+
+export type ExpensePayment = "cash_drawer" | "cash" | "card" | "transfer";
+
+export interface ExpenseCategory {
+  id: string;
+  name: string;
+  sort_order: number;
+}
+
+export interface Expense {
+  id: string;
+  expense_no: string;
+  category_id: string;
+  expense_date: string;
+  amount: number;
+  vat_amount: number;
+  payment_method: ExpensePayment;
+  payee: string | null;
+  reference: string | null;
+  notes: string | null;
+  receipt_path: string | null;
+  shift_movement_id: string | null;
+  created_at: string;
+}
+
+export interface ExpensesSummary {
+  total: number;
+  vat: number;
+  net: number;
+  count: number;
+  from_drawer: number;
+  by_category: { name: string; total: number; net: number; count: number }[];
+}

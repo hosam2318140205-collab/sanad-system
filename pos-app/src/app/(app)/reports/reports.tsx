@@ -5,9 +5,10 @@ import { useCallback, useEffect, useState } from "react";
 import { ColumnChart, RankBars } from "@/components/bar-chart";
 import { Button, Card, Input, Loading, PageHeader, Stat, Table, cn, useToast } from "@/components/ui";
 import { downloadCsv } from "@/lib/csv";
-import { PAYMENT_LABELS, REFUND_LABELS, errorMessage, isoDay, money, num } from "@/lib/format";
+import { PAYMENT_LABELS, REFUND_LABELS, errorMessage, money, num } from "@/lib/format";
+import { presets } from "@/lib/periods";
 import { supabase } from "@/lib/supabase/client";
-import type { PaymentMethod, RefundMethod } from "@/lib/types";
+import type { ExpensesSummary, PaymentMethod, RefundMethod } from "@/lib/types";
 
 interface Report {
   summary: {
@@ -34,37 +35,26 @@ interface Report {
   by_size: { name: string; qty: number; revenue: number }[];
 }
 
-function presets() {
-  const now = new Date();
-  const today = isoDay(now);
-  const d = (offset: number) => isoDay(new Date(now.getTime() - offset * 864e5));
-  const [y, m] = today.split("-").map(Number);
-  const monthStart = `${y}-${String(m).padStart(2, "0")}-01`;
-  const lastMonthEnd = isoDay(new Date(Date.UTC(y, m - 1, 0)));
-  const lastMonthStart = lastMonthEnd.slice(0, 8) + "01";
-  return [
-    { key: "today", label: "اليوم", from: today, to: today },
-    { key: "yesterday", label: "أمس", from: d(1), to: d(1) },
-    { key: "7", label: "آخر 7 أيام", from: d(6), to: today },
-    { key: "month", label: "هذا الشهر", from: monthStart, to: today },
-    { key: "last_month", label: "الشهر الماضي", from: lastMonthStart, to: lastMonthEnd },
-    { key: "year", label: "هذه السنة", from: `${y}-01-01`, to: today },
-  ];
-}
-
 export function Reports() {
   const toast = useToast();
   const [from, setFrom] = useState(() => presets()[3].from);
   const [to, setTo] = useState(() => presets()[3].to);
   const [report, setReport] = useState<Report | null>(null);
+  const [expenses, setExpenses] = useState<ExpensesSummary | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await supabase().rpc("sales_report", { p_from: from, p_to: to });
+    const db = supabase();
+    const [{ data, error }, { data: exp, error: expErr }] = await Promise.all([
+      db.rpc("sales_report", { p_from: from, p_to: to }),
+      db.rpc("expenses_summary", { p_from: from, p_to: to }),
+    ]);
     setLoading(false);
     if (error) return toast(errorMessage(error), "error");
     setReport(data as Report);
+    // قبل تنفيذ ترقية المصروفات لا توجد الدالة — نعرض التقرير بدونها
+    setExpenses(expErr ? null : (exp as ExpensesSummary));
   }, [from, to, toast]);
 
   useEffect(() => {
@@ -148,6 +138,17 @@ export function Reports() {
             <Stat label="تكلفة البضاعة المباعة" value={money(s.cost)} />
             <Stat label="مجمل الربح" value={money(s.gross_profit)} hint={`هامش ${s.margin}%`} tone="blue" />
           </div>
+          {expenses && (
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <Stat label="المصروفات (بدون الضريبة)" value={money(expenses.net)} hint={`${num(expenses.count)} مصروف`} tone="red" />
+              <Stat
+                label="صافي الربح"
+                value={money(Number(s.gross_profit) - Number(expenses.net))}
+                hint="مجمل الربح − المصروفات"
+                tone={Number(s.gross_profit) - Number(expenses.net) >= 0 ? "green" : "red"}
+              />
+            </div>
+          )}
 
           <Card className="p-4">
             <p className="mb-4 font-semibold">صافي المبيعات اليومية</p>

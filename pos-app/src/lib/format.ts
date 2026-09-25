@@ -1,4 +1,4 @@
-import type { MovementType, PaymentMethod, PurchaseStatus, RefundMethod, SaleStatus, UserRole } from "./types";
+import type { ExpensePayment, MovementType, PaymentMethod, PurchaseStatus, RefundMethod, SaleStatus, UserRole } from "./types";
 
 const moneyFmt = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const intFmt = new Intl.NumberFormat("en-US");
@@ -55,6 +55,13 @@ export const PAYMENT_LABELS: Record<PaymentMethod, string> = {
   card: "شبكة (مدى/فيزا)",
   transfer: "تحويل بنكي",
   exchange_credit: "رصيد استبدال",
+};
+
+export const EXPENSE_PAYMENT_LABELS: Record<ExpensePayment, string> = {
+  cash_drawer: "من درج الوردية",
+  cash: "نقدي (خارج الدرج)",
+  card: "شبكة / بطاقة",
+  transfer: "تحويل بنكي",
 };
 
 export const REFUND_LABELS: Record<RefundMethod, string> = {
