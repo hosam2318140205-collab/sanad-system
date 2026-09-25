@@ -157,8 +157,14 @@ export function Receipt({
           )}
           {Number(sale.promo_discount ?? 0) > 0 && (
             <tr style={{ fontSize: "0.9em" }}>
-              <td>منها عروض{sale.promo_code ? ` (${sale.promo_code})` : ""}</td>
+              <td>منها عروض</td>
               <td style={{ textAlign: "left" }}>{fmt(sale.promo_discount ?? 0)}</td>
+            </tr>
+          )}
+          {sale.promo_code && (
+            <tr style={{ fontSize: "0.9em" }}>
+              <td>الكوبون المستخدم</td>
+              <td style={{ textAlign: "left" }}>{sale.promo_code}</td>
             </tr>
           )}
           {Number(sale.loyalty_points_redeemed ?? 0) > 0 && (

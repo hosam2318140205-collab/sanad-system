@@ -127,6 +127,7 @@ export function PosScreen() {
   const [payCredit, setPayCredit] = useState<CreditInfo | null>(null);
   const [preparingPay, setPreparingPay] = useState(false);
   const clientRef = useRef<string | null>(null);
+  const [account, setAccount] = useState<{ customerId: string; data: PricedCart["customer"] } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const focusSearch = useCallback(() => {
@@ -187,6 +188,32 @@ export function PosScreen() {
         if (data) setCustomer(data as Customer);
       });
   }, [customerParam, reservationParam]);
+
+  // رصيد العميل ونقاطه فور اختياره (قبل إضافة أصناف)
+  useEffect(() => {
+    if (!customer) return;
+    const id = customer.id;
+    supabase()
+      .from("customer_accounts")
+      .select("loyalty_points, account_balance, credit_limit")
+      .eq("customer_id", id)
+      .maybeSingle()
+      .then(({ data }) => {
+        const a = data as { loyalty_points: number; account_balance: number; credit_limit: number | null } | null;
+        const balance = Number(a?.account_balance ?? 0);
+        const limit = a?.credit_limit ?? null;
+        setAccount({
+          customerId: id,
+          data: {
+            loyalty_points: Number(a?.loyalty_points ?? 0),
+            account_balance: balance,
+            credit_limit: limit,
+            credit_available: Math.max(Number(limit ?? 0) - balance, 0),
+            can_use_credit: true,
+          },
+        });
+      });
+  }, [customer]);
 
   // استلام حجز: /pos?reservation=<id> يملأ السلة بأصناف الحجز والعميل
   const reservationLoaded = useRef<string | null>(null);
@@ -299,6 +326,7 @@ export function PosScreen() {
     return () => clearTimeout(timer);
   }, [priceKey, priceRequest, cart.length]);
   const server = priced?.key === priceKey ? priced.data : null;
+  const customerInfo = server?.customer ?? (account && account.customerId === customer?.id ? account.data : undefined);
   const priceError = priced?.key === priceKey ? priced.error : null;
   const shown = {
     gross: server?.gross ?? totals.gross,
@@ -597,26 +625,26 @@ export function PosScreen() {
           <BookmarkCheck className="size-4 shrink-0" /> استلام الحجز {reservation.reservation_no}
         </div>
       )}
-      {customer && server?.customer && (
+      {customer && customerInfo && (
         <div className="mx-3 mt-3 flex flex-wrap gap-2 text-xs" data-testid="customer-chips">
           {settings.loyalty_enabled && (
             <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-800 ring-1 ring-amber-200">
               <Gift className="me-1 inline size-3.5" />
-              {server.customer.loyalty_points} نقطة
+              {customerInfo.loyalty_points} نقطة
             </span>
           )}
-          {Number(server.customer.account_balance) !== 0 && (
+          {Number(customerInfo.account_balance) !== 0 && (
             <span
               className={cn(
                 "rounded-full px-2.5 py-1 ring-1",
-                Number(server.customer.account_balance) > 0 ? "bg-red-50 text-red-700 ring-red-200" : "bg-emerald-50 text-emerald-700 ring-emerald-200",
+                Number(customerInfo.account_balance) > 0 ? "bg-red-50 text-red-700 ring-red-200" : "bg-emerald-50 text-emerald-700 ring-emerald-200",
               )}
             >
-              {Number(server.customer.account_balance) > 0 ? "عليه" : "له رصيد"} {money(Math.abs(Number(server.customer.account_balance)))}
+              {Number(customerInfo.account_balance) > 0 ? "عليه" : "له رصيد"} {money(Math.abs(Number(customerInfo.account_balance)))}
             </span>
           )}
-          {server.customer.credit_limit !== null && (
-            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700">متاح آجل {money(server.customer.credit_available)}</span>
+          {customerInfo.credit_limit !== null && (
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700">متاح آجل {money(customerInfo.credit_available)}</span>
           )}
         </div>
       )}
@@ -751,7 +779,7 @@ export function PosScreen() {
             </Button>
           )}
         </div>
-        {customer && settings.loyalty_enabled && (server?.customer?.loyalty_points ?? 0) >= Number(settings.loyalty_min_redeem) && (
+        {customer && settings.loyalty_enabled && (customerInfo?.loyalty_points ?? 0) >= Number(settings.loyalty_min_redeem) && (
           <div className="flex items-center gap-2">
             <Gift className="size-4 shrink-0 text-amber-600" />
             <Input
