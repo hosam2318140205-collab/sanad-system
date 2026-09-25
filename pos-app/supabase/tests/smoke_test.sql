@@ -80,6 +80,7 @@ do $$ begin
   end;
 end $$;
 
+select public.open_shift(0);
 insert into public.customers (id, name, phone) values ('60000000-0000-0000-0000-000000000001', 'عبدالله', '0500000000');
 
 -- بيع: 2 × 115 مع خصم فاتورة 10 → الإجمالي 220 شامل الضريبة

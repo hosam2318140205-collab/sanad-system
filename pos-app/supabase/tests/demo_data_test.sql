@@ -20,6 +20,7 @@ end $$;
 -- بيع صنف تجريبي كمالك
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000a1', true);
+select public.open_shift(0);
 select public.complete_sale(
   jsonb_build_array(jsonb_build_object('variant_id', (select id from public.product_variants where sku = 'DEMO-SHMG-RED'), 'qty', 1)),
   '[{"method":"cash","amount":95}]'::jsonb);
@@ -53,6 +54,7 @@ select set_config('pos.confirm_reset', 'DELETE-ALL-TRANSACTIONS', false);
 
 do $$ begin
   assert (select count(*) from public.sales) = 0, 'sales cleared';
+  assert (select count(*) from public.shifts) = 0, 'shifts cleared';
   assert (select count(*) from public.product_variants where sku like 'DEMO-%') = 0, 'demo fully removed after reset';
   assert (select count(*) from public.categories where name like '%(تجريبي)') = 0, 'demo categories removed';
   assert (select last_value from public.invoice_seq) = 1 and not (select is_called from public.invoice_seq), 'invoice numbering restarts at 1';

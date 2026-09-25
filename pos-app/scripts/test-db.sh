@@ -25,6 +25,9 @@ step supabase/setup/01_all_migrations.sql
 echo "▶ Smoke test (sales, VAT, returns, exchange, permissions, stock, counts, reports)"
 step supabase/tests/smoke_test.sql
 
+echo "▶ Shifts: open, link sales/returns, drawer math, blind close, permissions"
+step supabase/tests/shifts_test.sql
+
 echo "▶ Demo data: seed, remove, re-seed"
 step supabase/tests/demo_data_test.sql
 

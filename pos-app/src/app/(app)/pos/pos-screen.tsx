@@ -20,6 +20,7 @@ import {
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReceiptModal } from "@/components/receipt-modal";
+import { OpenShiftModal, fetchMyOpenShift } from "@/components/shift-dialogs";
 import type { ReceiptData } from "@/components/receipt";
 import { useSession } from "@/components/session-context";
 import { Badge, Button, Field, Input, Modal, cn, useToast } from "@/components/ui";
@@ -28,7 +29,7 @@ import { PAYMENT_LABELS, errorMessage, money, round2, variantLabel } from "@/lib
 import { balanceSplit, computeTotals } from "@/lib/pricing";
 import { loadReceipt } from "@/lib/sales";
 import { supabase } from "@/lib/supabase/client";
-import type { CatalogItem, Category, Customer, PaymentMethod, ReturnRecord } from "@/lib/types";
+import type { CatalogItem, Category, Customer, OpenShift, PaymentMethod, ReturnRecord } from "@/lib/types";
 
 interface CartLine {
   item: CatalogItem;
@@ -92,6 +93,8 @@ export function PosScreen() {
   const [receipt, setReceipt] = useState<ReceiptData | null>(null);
   const [credit, setCredit] = useState<ReturnRecord | null>(null);
   const [editLine, setEditLine] = useState<string | null>(null);
+  const [shift, setShift] = useState<OpenShift | null | undefined>(undefined);
+  const [showOpenShift, setShowOpenShift] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const focusSearch = useCallback(() => {
@@ -115,7 +118,8 @@ export function PosScreen() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data load
     loadCatalog();
     setHeld(readHeld());
-  }, [loadCatalog]);
+    fetchMyOpenShift(profile.id).then(setShift);
+  }, [loadCatalog, profile.id]);
 
   // رصيد الاستبدال القادم من شاشة المرتجعات
   useEffect(() => {
@@ -178,6 +182,7 @@ export function PosScreen() {
   const itemsCount = cart.reduce((s, l) => s + l.qty, 0);
   const discountPct = totals.gross > 0 ? (totals.discountTotal / totals.gross) * 100 : 0;
   const overLimit = profile.role === "cashier" && discountPct > Number(settings.max_cashier_discount_pct) + 0.001;
+  const needsShift = settings.require_shift && shift === null;
 
   // ---------------------------------------------------------------- cart ops
   const addToCart = useCallback(
@@ -312,7 +317,7 @@ export function PosScreen() {
         searchRef.current?.focus();
       } else if (e.key === "F9" || (e.ctrlKey && e.key === "Enter")) {
         e.preventDefault();
-        if (cart.length > 0 && !overLimit) setShowPay(true);
+        if (cart.length > 0 && !overLimit && !needsShift) setShowPay(true);
       } else if (e.key === "F4") {
         e.preventDefault();
         setShowCustomer(true);
@@ -486,6 +491,14 @@ export function PosScreen() {
           <span>الإجمالي</span>
           <span>{money(totals.total)}</span>
         </div>
+        {needsShift && (
+          <div className="flex items-center justify-between gap-2 rounded-lg bg-amber-50 p-2.5 text-sm text-amber-900">
+            <span>لا توجد وردية مفتوحة — افتح وردية لبدء البيع</span>
+            <Button size="sm" onClick={() => setShowOpenShift(true)}>
+              فتح وردية
+            </Button>
+          </div>
+        )}
         {overLimit && (
           <p className="rounded bg-red-50 p-2 text-xs text-red-700">
             الخصم يتجاوز الحد المسموح للكاشير ({Number(settings.max_cashier_discount_pct)}%)
@@ -505,7 +518,7 @@ export function PosScreen() {
           >
             <Trash2 className="size-5" />
           </Button>
-          <Button size="lg" className="col-span-2" disabled={cart.length === 0 || overLimit} onClick={() => setShowPay(true)}>
+          <Button size="lg" className="col-span-2" disabled={cart.length === 0 || overLimit || needsShift} onClick={() => setShowPay(true)}>
             الدفع (F9)
           </Button>
         </div>
@@ -658,6 +671,19 @@ export function PosScreen() {
         }}
       />
 
+      <OpenShiftModal
+        open={showOpenShift}
+        onClose={() => {
+          setShowOpenShift(false);
+          focusSearch();
+        }}
+        onOpened={() => {
+          setShowOpenShift(false);
+          fetchMyOpenShift(profile.id).then(setShift);
+          focusSearch();
+        }}
+      />
+
       {showPay && (
         <PaymentModal
           total={totals.total}
@@ -674,7 +700,11 @@ export function PosScreen() {
               p_invoice_discount: totals.invoiceDiscount,
               p_notes: null,
             });
-            if (error) throw error;
+            if (error) {
+              // الوردية قد تكون أُغلقت من المدير أثناء العمل
+              if (error.message.includes("وردية")) fetchMyOpenShift(profile.id).then(setShift);
+              throw error;
+            }
             await onCompleted(data as string);
           }}
         />

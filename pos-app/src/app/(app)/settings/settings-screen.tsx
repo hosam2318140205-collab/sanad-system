@@ -41,6 +41,7 @@ export function SettingsScreen() {
         prices_include_vat: s.prices_include_vat,
         allow_negative_stock: s.allow_negative_stock,
         allow_cashier_returns: s.allow_cashier_returns,
+        require_shift: s.require_shift,
         max_cashier_discount_pct: Number(s.max_cashier_discount_pct),
         return_days: Number(s.return_days),
       })
@@ -108,6 +109,7 @@ export function SettingsScreen() {
           <Checkbox label="أسعار البيع شاملة الضريبة (المعتاد في التجزئة)" checked={s.prices_include_vat} onChange={(v) => set("prices_include_vat", v)} />
           <Checkbox label="السماح بالبيع عند نفاد المخزون (مخزون سالب)" checked={s.allow_negative_stock} onChange={(v) => set("allow_negative_stock", v)} />
           <Checkbox label="السماح للكاشير بالإرجاع والاستبدال" checked={s.allow_cashier_returns} onChange={(v) => set("allow_cashier_returns", v)} />
+          <Checkbox label="البيع والإرجاع النقدي يتطلبان وردية مفتوحة" checked={s.require_shift} onChange={(v) => set("require_shift", v)} />
           <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">
             تغيير نسبة الضريبة أو طريقة التسعير يؤثر على الفواتير الجديدة فقط. الفواتير السابقة تحتفظ بنسبتها.
           </p>
