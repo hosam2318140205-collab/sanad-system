@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { BarcodeLabels, type LabelItem } from "@/components/barcode-labels";
+import { CameraScanButton, CameraScanner } from "@/components/camera-scanner";
 import { PrintPortal } from "@/components/print-portal";
 import { useSession } from "@/components/session-context";
 import { Badge, Button, Card, Checkbox, Field, Input, Loading, Modal, PageHeader, Select, Table, Textarea, useToast } from "@/components/ui";
@@ -85,6 +86,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
   const [colorHex, setColorHex] = useState("#000000");
   const [labels, setLabels] = useState<LabelItem[] | null>(null);
   const [labelsOpen, setLabelsOpen] = useState(false);
+  const [scanRow, setScanRow] = useState<string | null>(null);
 
   useEffect(() => {
     const db = supabase();
@@ -516,6 +518,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
                     <Field label="الباركود" className="col-span-2">
                       <div className="flex gap-2">
                         <Input dir="ltr" inputMode="numeric" className="h-9 min-w-0 flex-1" value={r.barcode} onChange={(e) => setRow(r.key, { barcode: e.target.value })} />
+                        <CameraScanButton size="sm" className="h-9 shrink-0" label="مسح باركود القطعة" onClick={() => setScanRow(r.key)} />
                         <Button type="button" variant="outline" size="sm" className="h-9 shrink-0" onClick={() => setRow(r.key, { barcode: generateEan13() })}>
                           توليد
                         </Button>
@@ -612,6 +615,18 @@ export function ProductForm({ productId }: { productId: string | null }) {
           </p>
         )}
       </Card>
+
+      <CameraScanner
+        open={scanRow !== null}
+        title="مسح الباركود المطبوع على القطعة"
+        onClose={() => setScanRow(null)}
+        onDetected={(code) => {
+          const other = rows.find((x) => !x.deleted && x.key !== scanRow && x.barcode === code);
+          if (other) return { ok: false, message: `الباركود مستخدم للمقاس ${variantLabel(other.size, other.color)}` };
+          if (scanRow) setRow(scanRow, { barcode: code });
+          return { ok: true, message: code };
+        }}
+      />
 
       <Modal
         open={labelsOpen}

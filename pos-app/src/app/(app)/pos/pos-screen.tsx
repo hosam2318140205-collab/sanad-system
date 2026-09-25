@@ -20,6 +20,7 @@ import {
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReceiptModal } from "@/components/receipt-modal";
+import { CameraScanButton, CameraScanner, type ScanOutcome } from "@/components/camera-scanner";
 import { OpenShiftModal, fetchMyOpenShift } from "@/components/shift-dialogs";
 import type { ReceiptData } from "@/components/receipt";
 import { useSession } from "@/components/session-context";
@@ -95,6 +96,7 @@ export function PosScreen() {
   const [editLine, setEditLine] = useState<string | null>(null);
   const [shift, setShift] = useState<OpenShift | null | undefined>(undefined);
   const [showOpenShift, setShowOpenShift] = useState(false);
+  const [showCamera, setShowCamera] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const focusSearch = useCallback(() => {
@@ -265,6 +267,30 @@ export function PosScreen() {
       return;
     }
     if (filtered.length === 0) toast(`لا يوجد صنف بالرمز ${code}`, "error");
+  };
+
+  // مسح بالكاميرا: الكاميرا تبقى مفتوحة بين القطع، لذا نقرأ السلة والمخزون الحاليين عبر refs
+  const cartRef = useRef(cart);
+  const catalogRef = useRef(catalog);
+  useEffect(() => {
+    cartRef.current = cart;
+    catalogRef.current = catalog;
+  });
+  const onCameraScan = (code: string): ScanOutcome => {
+    const lower = code.toLowerCase();
+    const item = catalogRef.current.find((v) => v.barcode === code || v.sku.toLowerCase() === lower);
+    if (!item) return { ok: false, message: `لا يوجد صنف بالرمز ${code}` };
+    const inCart = cartRef.current.find((l) => l.item.variant_id === item.variant_id)?.qty ?? 0;
+    if (!settings.allow_negative_stock && inCart + 1 > item.stock_qty) {
+      return { ok: false, message: `${item.product_name}: المتوفر ${item.stock_qty} فقط` };
+    }
+    addToCart(item);
+    // تحديث فوري حتى تُحسب المسحة التالية لنفس الصنف بشكل صحيح
+    cartRef.current = inCart
+      ? cartRef.current.map((l) => (l.item.variant_id === item.variant_id ? { ...l, qty: l.qty + 1 } : l))
+      : [...cartRef.current, { item, qty: 1, discount: 0 }];
+    const label = variantLabel(item.size, item.color);
+    return { ok: true, message: `${item.product_name}${label ? ` (${label})` : ""} — ${inCart + 1}` };
   };
 
   // ---------------------------------------------------------------- held carts
@@ -549,6 +575,7 @@ export function PosScreen() {
                 className="h-12 ps-10 text-base"
               />
             </div>
+            <CameraScanButton onClick={() => setShowCamera(true)} />
             <Button variant="outline" size="lg" onClick={loadCatalog} title="تحديث" aria-label="تحديث">
               <RefreshCw className={cn("size-5", loading && "animate-spin")} />
             </Button>
@@ -669,6 +696,17 @@ export function PosScreen() {
           setShowCustomer(false);
           focusSearch();
         }}
+      />
+
+      <CameraScanner
+        open={showCamera}
+        continuous
+        title="مسح القطع بالكاميرا"
+        onClose={() => {
+          setShowCamera(false);
+          focusSearch();
+        }}
+        onDetected={onCameraScan}
       />
 
       <OpenShiftModal

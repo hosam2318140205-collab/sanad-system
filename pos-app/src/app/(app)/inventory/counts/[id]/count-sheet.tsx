@@ -3,6 +3,7 @@
 import { ArrowRight, CheckCircle2, ScanBarcode, XCircle } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CameraScanButton, CameraScanner, type ScanOutcome } from "@/components/camera-scanner";
 import { useSession } from "@/components/session-context";
 import { Badge, Button, Card, ConfirmDialog, Input, Loading, PageHeader, Select, Stat, Table, cn, useToast } from "@/components/ui";
 import { fetchAllRows, normalize } from "@/lib/catalog";
@@ -30,6 +31,7 @@ export function CountSheet({ id }: { id: string }) {
   const [busy, setBusy] = useState(false);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
   const scanRef = useRef<HTMLInputElement>(null);
+  const [showCamera, setShowCamera] = useState(false);
 
   const load = useCallback(async () => {
     const db = supabase();
@@ -66,17 +68,29 @@ export function CountSheet({ id }: { id: string }) {
     if (error) toast(errorMessage(error), "error");
   };
 
+  // المسح المتتالي السريع (قارئ أو كاميرا) يقرأ آخر الكميات عبر ref وليس من حالة قديمة
+  const itemsRef = useRef(items);
+  useEffect(() => {
+    itemsRef.current = items;
+  });
+  const scanCode = (code: string): ScanOutcome => {
+    const lower = code.toLowerCase();
+    const item = itemsRef.current.find((i) => i.variant.barcode === code || i.variant.sku.toLowerCase() === lower);
+    if (!item) return { ok: false, message: `الصنف ${code} غير موجود في هذا الجرد` };
+    const qty = (item.counted_qty ?? 0) + 1;
+    itemsRef.current = itemsRef.current.map((i) => (i.id === item.id ? { ...i, counted_qty: qty } : i));
+    saveQty(item, qty);
+    setLastScanned(item.id);
+    const label = variantLabel(item.variant.size, item.variant.color);
+    return { ok: true, message: `${item.variant.product.name}${label ? ` (${label})` : ""} — المعدود ${qty}` };
+  };
+
   const onScan = () => {
     const code = scan.trim();
     if (!code) return;
-    const item = items.find((i) => i.variant.barcode === code || i.variant.sku.toLowerCase() === code.toLowerCase());
     setScan("");
-    if (!item) {
-      toast(`الصنف ${code} غير موجود في هذا الجرد`, "error");
-      return;
-    }
-    saveQty(item, (item.counted_qty ?? 0) + 1);
-    setLastScanned(item.id);
+    const outcome = scanCode(code);
+    if (!outcome.ok) toast(outcome.message, "error");
   };
 
   const filtered = useMemo(() => {
@@ -156,17 +170,20 @@ export function CountSheet({ id }: { id: string }) {
               e.preventDefault();
               onScan();
             }}
-            className="relative"
+            className="flex gap-2"
           >
-            <ScanBarcode className="pointer-events-none absolute start-3 top-1/2 size-5 -translate-y-1/2 text-slate-400" />
-            <Input
-              ref={scanRef}
-              autoFocus
-              className="h-12 ps-10 text-base"
-              placeholder="امسح باركود القطعة — كل مسح يضيف 1"
-              value={scan}
-              onChange={(e) => setScan(e.target.value)}
-            />
+            <div className="relative min-w-0 flex-1">
+              <ScanBarcode className="pointer-events-none absolute start-3 top-1/2 size-5 -translate-y-1/2 text-slate-400" />
+              <Input
+                ref={scanRef}
+                autoFocus
+                className="h-12 ps-10 text-base"
+                placeholder="امسح باركود القطعة — كل مسح يضيف 1"
+                value={scan}
+                onChange={(e) => setScan(e.target.value)}
+              />
+            </div>
+            <CameraScanButton onClick={() => setShowCamera(true)} />
           </form>
         </Card>
       )}
@@ -235,6 +252,17 @@ export function CountSheet({ id }: { id: string }) {
           </tbody>
         </Table>
       </Card>
+
+      <CameraScanner
+        open={showCamera}
+        continuous
+        title="جرد بالكاميرا — كل مسح يضيف 1"
+        onClose={() => {
+          setShowCamera(false);
+          scanRef.current?.focus();
+        }}
+        onDetected={scanCode}
+      />
 
       <ConfirmDialog
         open={confirm === "apply"}
