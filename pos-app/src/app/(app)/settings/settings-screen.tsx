@@ -44,6 +44,13 @@ export function SettingsScreen() {
         require_shift: s.require_shift,
         max_cashier_discount_pct: Number(s.max_cashier_discount_pct),
         return_days: Number(s.return_days),
+        loyalty_enabled: s.loyalty_enabled,
+        loyalty_points_per_sar: Number(s.loyalty_points_per_sar),
+        loyalty_point_value: Number(s.loyalty_point_value),
+        loyalty_min_redeem: Number(s.loyalty_min_redeem),
+        loyalty_max_redeem_pct: Number(s.loyalty_max_redeem_pct),
+        allow_cashier_credit: s.allow_cashier_credit,
+        reservation_days: Number(s.reservation_days),
       })
       .eq("id", 1);
     setBusy(false);
@@ -113,6 +120,39 @@ export function SettingsScreen() {
           <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">
             تغيير نسبة الضريبة أو طريقة التسعير يؤثر على الفواتير الجديدة فقط. الفواتير السابقة تحتفظ بنسبتها.
           </p>
+        </Card>
+
+        <Card className="space-y-3 p-4 lg:col-span-2" >
+          <h2 className="font-semibold">العملاء: نقاط الولاء، البيع الآجل، الحجز</h2>
+          <Checkbox label="تفعيل برنامج نقاط الولاء" checked={s.loyalty_enabled} onChange={(v) => set("loyalty_enabled", v)} />
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Field label="نقاط لكل 1 ر.س مدفوع" hint={`كل ${Number(s.loyalty_points_per_sar) > 0 ? (1 / Number(s.loyalty_points_per_sar)).toFixed(0) : "—"} ر.س = نقطة`}>
+              <Input type="number" step="0.01" min={0} value={s.loyalty_points_per_sar} onChange={(e) => set("loyalty_points_per_sar", Number(e.target.value))} />
+            </Field>
+            <Field label="قيمة النقطة (ر.س)" hint={`100 نقطة = ${(Number(s.loyalty_point_value) * 100).toFixed(2)} ر.س`}>
+              <Input type="number" step="0.01" min={0} value={s.loyalty_point_value} onChange={(e) => set("loyalty_point_value", Number(e.target.value))} />
+            </Field>
+            <Field label="أقل عدد نقاط للاستبدال">
+              <Input type="number" min={1} value={s.loyalty_min_redeem} onChange={(e) => set("loyalty_min_redeem", Number(e.target.value))} />
+            </Field>
+            <Field label="أقصى نسبة من الفاتورة بالنقاط %">
+              <Input type="number" min={1} max={100} value={s.loyalty_max_redeem_pct} onChange={(e) => set("loyalty_max_redeem_pct", Number(e.target.value))} />
+            </Field>
+          </div>
+          <p className="text-xs text-slate-500">
+            العائد للعميل = {(Number(s.loyalty_points_per_sar) * Number(s.loyalty_point_value) * 100).toFixed(2)}% من المدفوع. استبدال النقاط يُعامل كخصم
+            تُحسب الضريبة بعده، ولا تُكسب نقاط على الجزء الآجل أو رصيد الاستبدال.
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <Field label="مدة الحجز الافتراضية (أيام)">
+              <Input type="number" min={1} max={60} value={s.reservation_days} onChange={(e) => set("reservation_days", Number(e.target.value))} />
+            </Field>
+          </div>
+          <Checkbox
+            label="السماح للكاشير بالبيع الآجل (ضمن حد ائتمان العميل الذي يحدده المدير)"
+            checked={s.allow_cashier_credit}
+            onChange={(v) => set("allow_cashier_credit", v)}
+          />
         </Card>
       </div>
     </div>

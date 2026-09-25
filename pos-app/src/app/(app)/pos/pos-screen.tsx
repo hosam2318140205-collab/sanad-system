@@ -2,7 +2,9 @@
 
 import {
   Banknote,
+  BookmarkCheck,
   CreditCard,
+  Gift,
   Landmark,
   Minus,
   PauseCircle,
@@ -12,6 +14,7 @@ import {
   ScanBarcode,
   Search,
   ShoppingBag,
+  Ticket,
   Trash2,
   UserPlus,
   UserRound,
@@ -26,11 +29,12 @@ import type { ReceiptData } from "@/components/receipt";
 import { useSession } from "@/components/session-context";
 import { Badge, Button, Field, Input, Modal, cn, useToast } from "@/components/ui";
 import { fetchCatalog, fetchCategories, normalize } from "@/lib/catalog";
+import { newClientRef } from "@/lib/customers";
 import { PAYMENT_LABELS, errorMessage, money, round2, variantLabel } from "@/lib/format";
 import { balanceSplit, computeTotals } from "@/lib/pricing";
 import { loadReceipt } from "@/lib/sales";
 import { supabase } from "@/lib/supabase/client";
-import type { CatalogItem, Category, Customer, OpenShift, PaymentMethod, ReturnRecord } from "@/lib/types";
+import type { CatalogItem, Category, Customer, OpenShift, PaymentMethod, PricedCart, ReturnRecord } from "@/lib/types";
 
 interface CartLine {
   item: CatalogItem;
@@ -50,6 +54,18 @@ interface PaymentRow {
   method: Exclude<PaymentMethod, "exchange_credit">;
   amount: string;
   reference: string;
+}
+
+interface LoadedReservation {
+  id: string;
+  reservation_no: string;
+  items: Record<string, number>; // variant_id → qty
+}
+
+interface CreditInfo {
+  available: number;
+  allowed: boolean;
+  balance: number;
 }
 
 const HELD_KEY = "pos-held-carts";
@@ -75,6 +91,8 @@ export function PosScreen() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const creditId = searchParams.get("credit");
+  const reservationParam = searchParams.get("reservation");
+  const customerParam = searchParams.get("customer");
 
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -97,6 +115,18 @@ export function PosScreen() {
   const [shift, setShift] = useState<OpenShift | null | undefined>(undefined);
   const [showOpenShift, setShowOpenShift] = useState(false);
   const [showCamera, setShowCamera] = useState(false);
+  // 2.0: تسعير الخادم، الكوبون، النقاط، الحجز
+  const [promoInput, setPromoInput] = useState("");
+  const [promoCode, setPromoCode] = useState("");
+  const [redeemInput, setRedeemInput] = useState("");
+  const [redeemPoints, setRedeemPoints] = useState(0);
+  const [priced, setPriced] = useState<{ key: string; data: PricedCart | null; error: string | null } | null>(null);
+  const [reservation, setReservation] = useState<LoadedReservation | null>(null);
+  const [reservedMap, setReservedMap] = useState<Record<string, number>>({});
+  const [payTotal, setPayTotal] = useState<number | null>(null);
+  const [payCredit, setPayCredit] = useState<CreditInfo | null>(null);
+  const [preparingPay, setPreparingPay] = useState(false);
+  const clientRef = useRef<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const focusSearch = useCallback(() => {
@@ -106,9 +136,16 @@ export function PosScreen() {
   const loadCatalog = useCallback(async () => {
     setLoading(true);
     try {
-      const [items, cats] = await Promise.all([fetchCatalog(), fetchCategories()]);
+      const [items, cats, reserved] = await Promise.all([
+        fetchCatalog(),
+        fetchCategories(),
+        supabase().rpc("reserved_quantities"),
+      ]);
       setCatalog(items);
       setCategories(cats);
+      setReservedMap(
+        Object.fromEntries(((reserved.data ?? []) as Array<{ variant_id: string; reserved: number }>).map((r) => [r.variant_id, r.reserved])),
+      );
     } catch (e) {
       toast(errorMessage(e), "error");
     } finally {
@@ -137,6 +174,55 @@ export function PosScreen() {
         else toast("رصيد الاستبدال غير متاح أو مستخدم", "error");
       });
   }, [creditId, toast]);
+
+  // بيع لعميل من ملفه: /pos?customer=<id>
+  useEffect(() => {
+    if (!customerParam || reservationParam) return;
+    supabase()
+      .from("customers")
+      .select("*")
+      .eq("id", customerParam)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data) setCustomer(data as Customer);
+      });
+  }, [customerParam, reservationParam]);
+
+  // استلام حجز: /pos?reservation=<id> يملأ السلة بأصناف الحجز والعميل
+  const reservationLoaded = useRef<string | null>(null);
+  useEffect(() => {
+    if (!reservationParam || catalog.length === 0 || reservationLoaded.current === reservationParam) return;
+    reservationLoaded.current = reservationParam;
+    (async () => {
+      const db = supabase();
+      const { data } = await db
+        .from("reservations")
+        .select("id, reservation_no, status, customer:customers(*), items:reservation_items(variant_id, qty)")
+        .eq("id", reservationParam)
+        .maybeSingle();
+      const r = data as unknown as {
+        id: string;
+        reservation_no: string;
+        status: string;
+        customer: Customer;
+        items: Array<{ variant_id: string; qty: number }>;
+      } | null;
+      if (!r || r.status !== "active") {
+        toast("الحجز غير متاح (مستلم أو ملغي)", "error");
+        return;
+      }
+      const lines = r.items
+        .map((i) => {
+          const item = catalog.find((c) => c.variant_id === i.variant_id);
+          return item ? { item, qty: i.qty, discount: 0 } : null;
+        })
+        .filter((l): l is CartLine => l !== null);
+      setCart(lines);
+      setCustomer(r.customer);
+      setReservation({ id: r.id, reservation_no: r.reservation_no, items: Object.fromEntries(r.items.map((i) => [i.variant_id, i.qty])) });
+      toast(`تم تحميل الحجز ${r.reservation_no}`, "info");
+    })();
+  }, [reservationParam, catalog, toast]);
 
   // ---------------------------------------------------------------- derived
   const products = useMemo(() => {
@@ -186,14 +272,55 @@ export function PosScreen() {
   const overLimit = profile.role === "cashier" && discountPct > Number(settings.max_cashier_discount_pct) + 0.001;
   const needsShift = settings.require_shift && shift === null;
 
+  // المتاح للبيع = المخزون − المحجوز لعملاء آخرين (حجز الفاتورة الحالية متاح لها)
+  const availableOf = useCallback(
+    (item: CatalogItem) => item.stock_qty - Math.max((reservedMap[item.variant_id] ?? 0) - (reservation?.items[item.variant_id] ?? 0), 0),
+    [reservedMap, reservation],
+  );
+
+  // تسعير الخادم (العروض والنقاط والضريبة) — نفس دالة إتمام البيع، فلا اختلاف بين الشاشة والفاتورة
+  const priceRequest = useMemo(
+    () => ({
+      p_items: cart.map((l) => ({ variant_id: l.item.variant_id, qty: l.qty, discount: l.discount })),
+      p_invoice_discount: totals.invoiceDiscount,
+      p_promo_code: promoCode || null,
+      p_redeem_points: redeemPoints,
+      p_customer_id: customer?.id ?? null,
+    }),
+    [cart, totals.invoiceDiscount, promoCode, redeemPoints, customer],
+  );
+  const priceKey = JSON.stringify(priceRequest);
+  useEffect(() => {
+    if (cart.length === 0) return;
+    const timer = setTimeout(async () => {
+      const { data, error } = await supabase().rpc("price_cart", priceRequest);
+      setPriced({ key: priceKey, data: error ? null : (data as PricedCart), error: error ? errorMessage(error) : null });
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [priceKey, priceRequest, cart.length]);
+  const server = priced?.key === priceKey ? priced.data : null;
+  const priceError = priced?.key === priceKey ? priced.error : null;
+  const shown = {
+    gross: server?.gross ?? totals.gross,
+    discountTotal: server?.discount_total ?? totals.discountTotal,
+    subtotal: server?.subtotal ?? totals.subtotal,
+    vat: server?.vat ?? totals.vat,
+    total: server?.total ?? totals.total,
+  };
+
   // ---------------------------------------------------------------- cart ops
   const addToCart = useCallback(
     (item: CatalogItem, qty = 1) => {
       setCart((prev) => {
         const existing = prev.find((l) => l.item.variant_id === item.variant_id);
         const inCart = existing?.qty ?? 0;
-        if (!settings.allow_negative_stock && inCart + qty > item.stock_qty) {
-          toast(`الكمية المتوفرة من ${item.product_name} (${variantLabel(item.size, item.color)}) هي ${item.stock_qty} فقط`, "error");
+        const available = availableOf(item);
+        if (!settings.allow_negative_stock && inCart + qty > available) {
+          toast(
+            `المتاح من ${item.product_name} (${variantLabel(item.size, item.color)}) هو ${Math.max(available, 0)} فقط` +
+              (available < item.stock_qty ? " — الباقي محجوز لعملاء" : ""),
+            "error",
+          );
           return prev;
         }
         if (existing) {
@@ -202,7 +329,7 @@ export function PosScreen() {
         return [...prev, { item, qty, discount: 0 }];
       });
     },
-    [settings.allow_negative_stock, toast],
+    [settings.allow_negative_stock, toast, availableOf],
   );
 
   const setQty = (variantId: string, qty: number) => {
@@ -210,8 +337,8 @@ export function PosScreen() {
       prev.flatMap((l) => {
         if (l.item.variant_id !== variantId) return [l];
         if (qty <= 0) return [];
-        if (!settings.allow_negative_stock && qty > l.item.stock_qty) {
-          toast(`المتوفر ${l.item.stock_qty} فقط`, "error");
+        if (!settings.allow_negative_stock && qty > availableOf(l.item)) {
+          toast(`المتاح ${Math.max(availableOf(l.item), 0)} فقط`, "error");
           return [l];
         }
         return [{ ...l, qty, discount: Math.min(l.discount, round2(l.item.price * qty)) }];
@@ -229,15 +356,26 @@ export function PosScreen() {
     );
   };
 
+  const resetExtras = useCallback(() => {
+    setPromoInput("");
+    setPromoCode("");
+    setRedeemInput("");
+    setRedeemPoints(0);
+    setReservation(null);
+    setPriced(null);
+    clientRef.current = null;
+  }, []);
+
   const clearSale = useCallback(() => {
     setCart([]);
     setCustomer(null);
     setInvoiceDiscount("");
     setMobileCart(false);
-    if (creditId) router.replace("/pos");
+    if (creditId || reservationParam) router.replace("/pos");
     setCredit(null);
+    resetExtras();
     focusSearch();
-  }, [creditId, focusSearch, router]);
+  }, [creditId, reservationParam, focusSearch, router, resetExtras]);
 
   const onProductClick = (productId: string) => {
     const p = products.find((x) => x.product_id === productId);
@@ -281,8 +419,8 @@ export function PosScreen() {
     const item = catalogRef.current.find((v) => v.barcode === code || v.sku.toLowerCase() === lower);
     if (!item) return { ok: false, message: `لا يوجد صنف بالرمز ${code}` };
     const inCart = cartRef.current.find((l) => l.item.variant_id === item.variant_id)?.qty ?? 0;
-    if (!settings.allow_negative_stock && inCart + 1 > item.stock_qty) {
-      return { ok: false, message: `${item.product_name}: المتوفر ${item.stock_qty} فقط` };
+    if (!settings.allow_negative_stock && inCart + 1 > availableOf(item)) {
+      return { ok: false, message: `${item.product_name}: المتاح ${Math.max(availableOf(item), 0)} فقط` };
     }
     addToCart(item);
     // تحديث فوري حتى تُحسب المسحة التالية لنفس الصنف بشكل صحيح
@@ -335,6 +473,28 @@ export function PosScreen() {
     setShowHeld(false);
   };
 
+  // قبل الدفع: تسعير نهائي من الخادم + مفتاح عملية جديد (يُعاد استخدامه عند إعادة المحاولة)
+  const openPayment = async () => {
+    if (preparingPay) return;
+    setPreparingPay(true);
+    const { data, error } = await supabase().rpc("price_cart", priceRequest);
+    setPreparingPay(false);
+    if (error) {
+      toast(errorMessage(error), "error");
+      return;
+    }
+    const p = data as PricedCart;
+    setPriced({ key: priceKey, data: p, error: null });
+    setPayTotal(p.total);
+    setPayCredit(
+      customer && p.customer
+        ? { available: Number(p.customer.credit_available), allowed: p.customer.can_use_credit, balance: Number(p.customer.account_balance) }
+        : null,
+    );
+    clientRef.current = newClientRef();
+    setShowPay(true);
+  };
+
   // ---------------------------------------------------------------- keyboard
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -343,7 +503,7 @@ export function PosScreen() {
         searchRef.current?.focus();
       } else if (e.key === "F9" || (e.ctrlKey && e.key === "Enter")) {
         e.preventDefault();
-        if (cart.length > 0 && !overLimit && !needsShift) setShowPay(true);
+        if (cart.length > 0 && !overLimit && !needsShift) openPayment();
       } else if (e.key === "F4") {
         e.preventDefault();
         setShowCustomer(true);
@@ -357,6 +517,12 @@ export function PosScreen() {
   });
 
   // ---------------------------------------------------------------- complete
+  const applyPromo = () => setPromoCode(promoInput.trim().toUpperCase());
+  const applyPoints = () => {
+    const n = Math.max(0, Math.floor(Number(redeemInput) || 0));
+    setRedeemPoints(n);
+  };
+
   const onCompleted = async (saleId: string) => {
     setShowPay(false);
     try {
@@ -376,8 +542,17 @@ export function PosScreen() {
     setCustomer(null);
     setInvoiceDiscount("");
     setMobileCart(false);
-    if (creditId) router.replace("/pos");
+    if (creditId || reservationParam) router.replace("/pos");
     setCredit(null);
+    if (reservation) {
+      // أصناف الحجز لم تعد محجوزة
+      setReservedMap((m) => {
+        const next = { ...m };
+        for (const [v, q] of Object.entries(reservation.items)) next[v] = Math.max((next[v] ?? 0) - q, 0);
+        return next;
+      });
+    }
+    resetExtras();
   };
 
   const pickerProduct = products.find((p) => p.product_id === picker) ?? null;
@@ -393,8 +568,16 @@ export function PosScreen() {
           <UserRound className="size-4 shrink-0 text-slate-500" />
           <span className="truncate">{customer ? `${customer.name} ${customer.phone ?? ""}` : "عميل نقدي (F4)"}</span>
         </button>
-        {customer && (
-          <button onClick={() => setCustomer(null)} className="p-1 text-slate-400 hover:text-red-600" aria-label="إزالة العميل">
+        {customer && !reservation && (
+          <button
+            onClick={() => {
+              setCustomer(null);
+              setRedeemPoints(0);
+              setRedeemInput("");
+            }}
+            className="p-1 text-slate-400 hover:text-red-600"
+            aria-label="إزالة العميل"
+          >
             <X className="size-4" />
           </button>
         )}
@@ -407,6 +590,34 @@ export function PosScreen() {
       {credit && (
         <div className="mx-3 mt-3 rounded-lg bg-violet-50 p-2.5 text-sm text-violet-800">
           استبدال: رصيد {money(credit.total)} من المرتجع {credit.return_no}
+        </div>
+      )}
+      {reservation && (
+        <div className="mx-3 mt-3 flex items-center gap-2 rounded-lg bg-sky-50 p-2.5 text-sm text-sky-800" data-testid="reservation-banner">
+          <BookmarkCheck className="size-4 shrink-0" /> استلام الحجز {reservation.reservation_no}
+        </div>
+      )}
+      {customer && server?.customer && (
+        <div className="mx-3 mt-3 flex flex-wrap gap-2 text-xs" data-testid="customer-chips">
+          {settings.loyalty_enabled && (
+            <span className="rounded-full bg-amber-50 px-2.5 py-1 text-amber-800 ring-1 ring-amber-200">
+              <Gift className="me-1 inline size-3.5" />
+              {server.customer.loyalty_points} نقطة
+            </span>
+          )}
+          {Number(server.customer.account_balance) !== 0 && (
+            <span
+              className={cn(
+                "rounded-full px-2.5 py-1 ring-1",
+                Number(server.customer.account_balance) > 0 ? "bg-red-50 text-red-700 ring-red-200" : "bg-emerald-50 text-emerald-700 ring-emerald-200",
+              )}
+            >
+              {Number(server.customer.account_balance) > 0 ? "عليه" : "له رصيد"} {money(Math.abs(Number(server.customer.account_balance)))}
+            </span>
+          )}
+          {server.customer.credit_limit !== null && (
+            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-slate-700">متاح آجل {money(server.customer.credit_available)}</span>
+          )}
         </div>
       )}
 
@@ -427,8 +638,13 @@ export function PosScreen() {
                       {variantLabel(l.item.size, l.item.color) || l.item.sku} · {money(l.item.price)}
                     </p>
                   </div>
-                  <p className="text-sm font-semibold">{money(totals.lines[idx]?.lineTotal ?? 0)}</p>
+                  <p className="text-sm font-semibold">{money(server?.lines[idx]?.line_total ?? totals.lines[idx]?.lineTotal ?? 0)}</p>
                 </div>
+                {Number(server?.lines[idx]?.promo ?? 0) > 0 && (
+                  <p className="mt-1 text-xs font-medium text-emerald-700">
+                    عرض: − {money(server!.lines[idx].promo)}
+                  </p>
+                )}
                 <div className="mt-2 flex items-center gap-2">
                   <div className="flex items-center rounded-lg border border-slate-200">
                     <button className="p-1.5 hover:bg-slate-100" onClick={() => setQty(l.item.variant_id, l.qty - 1)} aria-label="إنقاص">
@@ -507,15 +723,73 @@ export function PosScreen() {
             ))}
           </div>
         </div>
-        <Row label={`المجموع (${itemsCount} قطعة)`} value={money(totals.gross)} />
-        {totals.discountTotal > 0 && (
-          <Row label={`الخصم (${discountPct.toFixed(1)}%)`} value={`- ${money(totals.discountTotal)}`} className="text-red-600" />
+        <div className="flex items-center gap-2">
+          <Ticket className="size-4 shrink-0 text-slate-500" />
+          <Input
+            className="h-8 flex-1 uppercase"
+            dir="ltr"
+            placeholder="كوبون خصم"
+            value={promoInput}
+            onChange={(e) => setPromoInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && applyPromo()}
+            aria-label="كوبون خصم"
+          />
+          {promoCode ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setPromoCode("");
+                setPromoInput("");
+              }}
+            >
+              إزالة
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={applyPromo} disabled={!promoInput.trim()}>
+              تطبيق
+            </Button>
+          )}
+        </div>
+        {customer && settings.loyalty_enabled && (server?.customer?.loyalty_points ?? 0) >= Number(settings.loyalty_min_redeem) && (
+          <div className="flex items-center gap-2">
+            <Gift className="size-4 shrink-0 text-amber-600" />
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              className="h-8 flex-1"
+              placeholder={`استبدال نقاط (حد أدنى ${settings.loyalty_min_redeem})`}
+              value={redeemInput}
+              onChange={(e) => setRedeemInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applyPoints()}
+              aria-label="نقاط للاستبدال"
+            />
+            <Button size="sm" variant="outline" onClick={applyPoints}>
+              {redeemPoints > 0 ? "تحديث" : "استبدال"}
+            </Button>
+          </div>
         )}
-        <Row label="الإجمالي قبل الضريبة" value={money(totals.subtotal)} />
-        <Row label={`ضريبة القيمة المضافة ${vatRate}%`} value={money(totals.vat)} />
+        {priceError && <p className="rounded bg-red-50 p-2 text-xs text-red-700" data-testid="price-error">{priceError}</p>}
+        <Row label={`المجموع (${itemsCount} قطعة)`} value={money(shown.gross)} />
+        {server?.promotions.map((pr) => (
+          <Row key={pr.id} label={`عرض: ${pr.name}`} value={`- ${money(pr.discount)}`} className="text-emerald-700" />
+        ))}
+        {Number(server?.loyalty_discount ?? 0) > 0 && (
+          <Row label={`نقاط (${server!.loyalty_points})`} value={`- ${money(server!.loyalty_value)}`} className="text-amber-700" />
+        )}
+        {shown.discountTotal > 0 && (
+          <Row
+            label={`إجمالي الخصم (${shown.gross > 0 ? ((shown.discountTotal / shown.gross) * 100).toFixed(1) : "0"}%)`}
+            value={`- ${money(shown.discountTotal)}`}
+            className="text-red-600"
+          />
+        )}
+        <Row label="الإجمالي قبل الضريبة" value={money(shown.subtotal)} />
+        <Row label={`ضريبة القيمة المضافة ${vatRate}%`} value={money(shown.vat)} />
         <div className="flex items-center justify-between border-t border-slate-200 pt-2 text-lg font-bold">
           <span>الإجمالي</span>
-          <span>{money(totals.total)}</span>
+          <span data-testid="cart-total">{money(shown.total)}</span>
         </div>
         {needsShift && (
           <div className="flex items-center justify-between gap-2 rounded-lg bg-amber-50 p-2.5 text-sm text-amber-900">
@@ -544,7 +818,13 @@ export function PosScreen() {
           >
             <Trash2 className="size-5" />
           </Button>
-          <Button size="lg" className="col-span-2" disabled={cart.length === 0 || overLimit || needsShift} onClick={() => setShowPay(true)}>
+          <Button
+            size="lg"
+            className="col-span-2"
+            disabled={cart.length === 0 || overLimit || needsShift || !!priceError}
+            loading={preparingPay}
+            onClick={openPayment}
+          >
             الدفع (F9)
           </Button>
         </div>
@@ -656,7 +936,7 @@ export function PosScreen() {
         <span className="flex items-center gap-2">
           <ShoppingBag className="size-5" /> السلة ({itemsCount})
         </span>
-        <span className="font-bold">{money(totals.total)}</span>
+        <span className="font-bold">{money(shown.total)}</span>
       </button>
       {mobileCart && (
         <div className="no-print fixed inset-0 z-40 flex flex-col bg-white lg:hidden">
@@ -683,6 +963,7 @@ export function PosScreen() {
           focusSearch();
         }}
         allowNegative={settings.allow_negative_stock}
+        availableOf={availableOf}
       />
 
       <CustomerPicker
@@ -722,21 +1003,26 @@ export function PosScreen() {
         }}
       />
 
-      {showPay && (
+      {showPay && payTotal !== null && (
         <PaymentModal
-          total={totals.total}
+          total={payTotal}
           credit={credit}
+          customerCredit={payCredit}
           onClose={() => {
             setShowPay(false);
             focusSearch();
           }}
           onSubmit={async (payments) => {
             const { data, error } = await supabase().rpc("complete_sale", {
-              p_items: cart.map((l) => ({ variant_id: l.item.variant_id, qty: l.qty, discount: l.discount })),
+              p_items: priceRequest.p_items,
               p_payments: payments,
               p_customer_id: customer?.id ?? null,
               p_invoice_discount: totals.invoiceDiscount,
               p_notes: null,
+              p_client_ref: clientRef.current,
+              p_promo_code: promoCode || null,
+              p_redeem_points: redeemPoints,
+              p_reservation_id: reservation?.id ?? null,
             });
             if (error) {
               // الوردية قد تكون أُغلقت من المدير أثناء العمل
@@ -808,11 +1094,13 @@ function VariantPicker({
   onClose,
   onPick,
   allowNegative,
+  availableOf,
 }: {
   product: { name: string; image_url: string | null; variants: CatalogItem[] } | null;
   onClose: () => void;
   onPick: (v: CatalogItem) => void;
   allowNegative: boolean;
+  availableOf: (v: CatalogItem) => number;
 }) {
   if (!product) return null;
   const colors = [...new Set(product.variants.map((v) => v.color ?? ""))];
@@ -833,7 +1121,8 @@ function VariantPicker({
               )}
               <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
                 {vs.map((v) => {
-                  const out = v.stock_qty <= 0;
+                  const available = availableOf(v);
+                  const out = available <= 0;
                   return (
                     <button
                       key={v.variant_id}
@@ -845,7 +1134,10 @@ function VariantPicker({
                       )}
                     >
                       <div className="text-base font-bold">{v.size || "—"}</div>
-                      <div className="text-xs">{out ? "نفد" : `متوفر ${v.stock_qty}`}</div>
+                      <div className="text-xs">
+                        {out ? (v.stock_qty > 0 ? "محجوز" : "نفد") : `متوفر ${available}`}
+                        {!out && available < v.stock_qty && <span className="block text-sky-700">محجوز {v.stock_qty - available}</span>}
+                      </div>
                       <div className="text-xs font-medium text-brand-700">{v.price.toFixed(2)}</div>
                     </button>
                   );
@@ -956,16 +1248,19 @@ function CustomerPicker({ open, onClose, onPick }: { open: boolean; onClose: () 
 // ======================================================================
 // Payment: cash / card / transfer / split + exchange credit
 // ======================================================================
-const METHOD_ICONS = { cash: Banknote, card: CreditCard, transfer: Landmark };
+const METHOD_ICONS = { cash: Banknote, card: CreditCard, transfer: Landmark, on_account: BookmarkCheck };
 
 function PaymentModal({
   total,
   credit,
+  customerCredit,
   onClose,
   onSubmit,
 }: {
   total: number;
   credit: ReturnRecord | null;
+  /** للعميل المختار: المتاح للبيع الآجل (حد الائتمان − الرصيد + أي رصيد دائن) */
+  customerCredit: CreditInfo | null;
   onClose: () => void;
   onSubmit: (payments: Array<Record<string, unknown>>) => Promise<void>;
 }) {
@@ -981,7 +1276,12 @@ function PaymentModal({
   const remaining = round2(due - paid);
   const change = round2(Math.max(paid - due, 0));
   const creditTooBig = creditAmount > total + 0.001;
-  const invalid = remaining > 0.001 || nonCash > due + 0.001 || creditTooBig;
+  // الآجل: المتاح = (حد الائتمان − الرصيد) أو الرصيد الدائن للعميل
+  const accountRoom = customerCredit ? round2(Math.max(customerCredit.available, -customerCredit.balance, 0)) : 0;
+  const canAccount = !!customerCredit && customerCredit.allowed && accountRoom > 0;
+  const onAccount = round2(rows.filter((r) => r.method === "on_account").reduce((s, r) => s + (Number(r.amount) || 0), 0));
+  const accountTooBig = onAccount > accountRoom + 0.001;
+  const invalid = remaining > 0.001 || nonCash > due + 0.001 || creditTooBig || accountTooBig;
 
   const setRow = (i: number, patch: Partial<PaymentRow>) => setRows((r) => r.map((x, idx) => (idx === i ? { ...x, ...patch } : x)));
   // تعديل مبلغ أي دفعة يعيد حساب المتبقي في الدفعة المقابلة تلقائياً
@@ -993,7 +1293,8 @@ function PaymentModal({
       return next.length > 1 ? balanceSplit(next, 0, due) : next;
     });
 
-  const selectSingle = (method: PaymentRow["method"]) => setRows([{ method, amount: due.toFixed(2), reference: "" }]);
+  const selectSingle = (method: PaymentRow["method"]) =>
+    setRows([{ method, amount: (method === "on_account" ? Math.min(due, accountRoom) : due).toFixed(2), reference: "" }]);
 
   const quickCash = [...new Set([due, Math.ceil(due / 10) * 10, Math.ceil(due / 50) * 50, Math.ceil(due / 100) * 100, Math.ceil(due / 500) * 500])]
     .filter((v) => v >= due)
@@ -1050,8 +1351,8 @@ function PaymentModal({
           </p>
         )}
 
-        <div className="grid grid-cols-3 gap-2">
-          {(["cash", "card", "transfer"] as const).map((m) => {
+        <div className={cn("grid gap-2", canAccount ? "grid-cols-4" : "grid-cols-3")}>
+          {(canAccount ? (["cash", "card", "transfer", "on_account"] as const) : (["cash", "card", "transfer"] as const)).map((m) => {
             const Icon = METHOD_ICONS[m];
             const active = rows.length === 1 && rows[0].method === m;
             return (
@@ -1064,7 +1365,7 @@ function PaymentModal({
                 )}
               >
                 <Icon className="size-6" />
-                {PAYMENT_LABELS[m]}
+                {m === "on_account" ? "آجل" : PAYMENT_LABELS[m]}
               </button>
             );
           })}
@@ -1082,6 +1383,7 @@ function PaymentModal({
                 <option value="cash">نقدي</option>
                 <option value="card">شبكة</option>
                 <option value="transfer">تحويل</option>
+                {canAccount && <option value="on_account">آجل</option>}
               </select>
               <Input
                 type="number"
@@ -1095,7 +1397,7 @@ function PaymentModal({
                 onChange={(e) => setAmount(i, e.target.value)}
                 aria-label="المبلغ"
               />
-              {r.method !== "cash" && (
+              {r.method !== "cash" && r.method !== "on_account" && (
                 <Input
                   className="order-last h-11 w-full sm:order-none sm:w-28"
                   placeholder="مرجع"
@@ -1141,6 +1443,16 @@ function PaymentModal({
           </div>
         </div>
         {nonCash > due + 0.001 && <p className="text-sm text-red-600">مبلغ الشبكة/التحويل لا يمكن أن يتجاوز المطلوب</p>}
+        {customerCredit && (
+          <p className="rounded-lg bg-slate-50 p-2 text-xs text-slate-600" data-testid="credit-info">
+            {canAccount
+              ? `المتاح للبيع الآجل لهذا العميل: ${money(accountRoom)}`
+              : customerCredit.allowed
+                ? "لا يوجد حد ائتمان متاح لهذا العميل"
+                : "البيع الآجل غير مسموح للكاشير"}
+          </p>
+        )}
+        {accountTooBig && <p className="text-sm text-red-600">المبلغ الآجل يتجاوز المتاح ({money(accountRoom)})</p>}
       </div>
     </Modal>
   );

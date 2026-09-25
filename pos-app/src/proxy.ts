@@ -2,7 +2,8 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 import { SUPABASE_ANON_KEY, SUPABASE_URL, isSupabaseConfigured } from "@/lib/supabase/env";
 
-const PUBLIC_PATHS = ["/login", "/setup"];
+// /r/<رمز> : رابط الفاتورة للعميل (بدون تسجيل دخول — الدالة تعرض بيانات الفاتورة فقط)
+const PUBLIC_PATHS = ["/login", "/setup", "/r/"];
 
 export async function proxy(request: NextRequest) {
   if (!isSupabaseConfigured) {

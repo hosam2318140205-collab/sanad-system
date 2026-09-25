@@ -11,7 +11,7 @@ export async function loadReceipt(saleId: string): Promise<ReceiptData> {
   const [{ data: sale, error }, { data: items }, { data: payments }] = await Promise.all([
     db
       .from("sales")
-      .select("*, customer:customers(name, vat_number), cashier:profiles(full_name)")
+      .select("*, customer:customers(id, name, vat_number, phone), cashier:profiles(full_name)")
       .eq("id", saleId)
       .single(),
     db.from("sale_items").select(SALE_ITEM_COLUMNS).eq("sale_id", saleId),
@@ -19,9 +19,15 @@ export async function loadReceipt(saleId: string): Promise<ReceiptData> {
   ]);
   if (error || !sale) throw error ?? new Error("الفاتورة غير موجودة");
   const s = sale as Sale & {
-    customer: { name: string; vat_number: string | null } | null;
+    customer: { id: string; name: string; vat_number: string | null; phone: string | null } | null;
     cashier: { full_name: string } | null;
   };
+  type Account = { loyalty_points: number; account_balance: number };
+  const account: Account | null = s.customer_id
+    ? ((
+        await db.from("customer_accounts").select("loyalty_points, account_balance").eq("customer_id", s.customer_id).maybeSingle()
+      ).data as Account | null)
+    : null;
   return {
     sale: s,
     items: (items ?? []) as SaleItem[],
@@ -29,6 +35,10 @@ export async function loadReceipt(saleId: string): Promise<ReceiptData> {
     cashierName: s.cashier?.full_name,
     customerName: s.customer?.name,
     customerVat: s.customer?.vat_number,
+    customerPhone: s.customer?.phone,
+    customerId: s.customer?.id,
+    customerPoints: account ? Number(account.loyalty_points) : null,
+    customerBalance: account ? Number(account.account_balance) : null,
   };
 }
 

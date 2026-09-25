@@ -3,6 +3,7 @@
 import { Printer, Repeat, Search, Undo2 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
+import { CameraScanButton, CameraScanner } from "@/components/camera-scanner";
 import { PrintPortal } from "@/components/print-portal";
 import { useSession } from "@/components/session-context";
 import { Badge, Button, Card, EmptyState, Field, Input, Modal, PageHeader, Select, Table, Textarea, cn, useToast } from "@/components/ui";
@@ -39,6 +40,15 @@ interface ReturnableSale {
 
 type RecentReturn = ReturnRecord & { sale: { invoice_no: string } | null };
 
+interface ReturnContext {
+  customer_id: string | null;
+  customer_phone: string | null;
+  on_account: number;
+  max_direct_refund: number | null;
+  loyalty_points_earned: number;
+  loyalty_points_redeemed: number;
+}
+
 export function ReturnsScreen() {
   const toast = useToast();
   const router = useRouter();
@@ -54,6 +64,8 @@ export function ReturnsScreen() {
   const [busy, setBusy] = useState(false);
   const [recent, setRecent] = useState<RecentReturn[]>([]);
   const [note, setNote] = useState<(RecentReturn & { items?: ReturnableItem[] }) | null>(null);
+  const [ctx, setCtx] = useState<ReturnContext | null>(null);
+  const [showCamera, setShowCamera] = useState(false);
 
   const loadRecent = useCallback(async () => {
     const { data } = await supabase()
@@ -68,17 +80,30 @@ export function ReturnsScreen() {
     async (code: string) => {
       if (!code.trim()) return;
       setSearching(true);
-      const { data, error } = await supabase().rpc("get_sale_for_return", { p_invoice_no: code.trim() });
-      setSearching(false);
+      const db = supabase();
+      // رقم الفاتورة، أو رابط/رمز QR المطبوع على الفاتورة
+      const resolved = await db.rpc("resolve_invoice_ref", { p_ref: code.trim() });
+      const invoiceNo = resolved.error ? code.trim() : (resolved.data as string);
+      const { data, error } = await db.rpc("get_sale_for_return", { p_invoice_no: invoiceNo });
       if (error) {
+        setSearching(false);
         setSale(null);
+        setCtx(null);
         toast(errorMessage(error), "error");
         return;
       }
       const s = data as ReturnableSale;
+      const { data: c } = await db.rpc("sale_return_context", { p_sale_id: s.id });
+      setSearching(false);
+      const context = c as ReturnContext | null;
+      setCtx(context);
+      setInvoice(s.invoice_no);
       setSale(s);
       setQtys({});
       setRestock(Object.fromEntries(s.items.map((i) => [i.id, true])));
+      // فاتورة فيها آجل: الافتراضي إرجاع المبلغ إلى حساب العميل
+      if (context && Number(context.on_account) > 0) setMethod("account");
+      else setMethod((m) => (m === "account" && !context?.customer_id ? "exchange" : m));
     },
     [toast],
   );
@@ -117,17 +142,22 @@ export function ReturnsScreen() {
       router.push(`/pos?credit=${returnId}`);
       return;
     }
-    toast("تم الإرجاع بنجاح");
+    toast(method === "account" ? "تم الإرجاع وإضافة المبلغ إلى حساب العميل" : "تم الإرجاع بنجاح");
     const { data: ret } = await supabase().from("returns").select("*, sale:sales(invoice_no)").eq("id", returnId).single();
     const returnedItems = sale.items
       .filter((i) => (qtys[i.id] ?? 0) > 0)
       .map((i) => ({ ...i, qty: qtys[i.id] }));
     setNote({ ...(ret as RecentReturn), items: returnedItems });
     setSale(null);
+    setCtx(null);
     setInvoice("");
     setReason("");
     loadRecent();
   };
+
+  const methods = (Object.keys(REFUND_LABELS) as RefundMethod[]).filter((m) => m !== "account" || !!ctx?.customer_id);
+  const overDirect =
+    ctx?.max_direct_refund != null && method !== "account" && total > Number(ctx.max_direct_refund) + 0.001;
 
   if (!settings.allow_cashier_returns && profile.role === "cashier") {
     return (
@@ -149,7 +179,16 @@ export function ReturnsScreen() {
             find(invoice);
           }}
         >
-          <Input dir="ltr" autoFocus className="h-12 text-base" placeholder="رقم الفاتورة INV-..." value={invoice} onChange={(e) => setInvoice(e.target.value)} />
+          <Input
+            dir="ltr"
+            autoFocus
+            className="h-12 text-base"
+            placeholder="رقم الفاتورة INV-... أو امسح QR الفاتورة"
+            value={invoice}
+            onChange={(e) => setInvoice(e.target.value)}
+            aria-label="رقم الفاتورة"
+          />
+          <CameraScanButton onClick={() => setShowCamera(true)} label="مسح QR الفاتورة" />
           <Button type="submit" size="lg" loading={searching}>
             <Search className="size-5" /> بحث
           </Button>
@@ -220,8 +259,8 @@ export function ReturnsScreen() {
           </Table>
           <div className="grid gap-4 border-t border-slate-100 p-4 md:grid-cols-3">
             <Field label="طريقة الاسترداد">
-              <Select value={method} onChange={(e) => setMethod(e.target.value as RefundMethod)}>
-                {(Object.keys(REFUND_LABELS) as RefundMethod[]).map((m) => (
+              <Select value={method} onChange={(e) => setMethod(e.target.value as RefundMethod)} aria-label="طريقة الاسترداد">
+                {methods.map((m) => (
                   <option key={m} value={m}>
                     {REFUND_LABELS[m]}
                   </option>
@@ -232,11 +271,28 @@ export function ReturnsScreen() {
               <Textarea className="min-h-10" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="مقاس غير مناسب، عيب صناعة..." />
             </Field>
           </div>
+          {ctx && (Number(ctx.on_account) > 0 || Number(ctx.loyalty_points_earned) > 0 || Number(ctx.loyalty_points_redeemed) > 0) && (
+            <div className="space-y-1 border-t border-slate-100 bg-slate-50 p-4 text-sm text-slate-700" data-testid="return-context">
+              {Number(ctx.on_account) > 0 && (
+                <p>
+                  الفاتورة فيها {money(ctx.on_account)} آجل. الحد الأقصى للرد نقداً/شبكة/استبدال:{" "}
+                  <span className="font-semibold">{money(ctx.max_direct_refund ?? 0)}</span> — والباقي «إلى حساب العميل».
+                </p>
+              )}
+              {Number(ctx.loyalty_points_earned) > 0 && <p>ستُعكس نقاط الفاتورة ({ctx.loyalty_points_earned}) بنسبة المرتجع.</p>}
+              {Number(ctx.loyalty_points_redeemed) > 0 && <p>ستُسترجع النقاط المستبدلة ({ctx.loyalty_points_redeemed}) بنسبة المرتجع.</p>}
+            </div>
+          )}
+          {overDirect && (
+            <p className="bg-red-50 p-3 text-sm text-red-700">
+              المبلغ يتجاوز ما دُفع فعلاً ({money(ctx!.max_direct_refund ?? 0)}) — اختر «إلى حساب العميل».
+            </p>
+          )}
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 p-4">
             <p className="text-lg">
               مبلغ الإرجاع: <span className="font-bold text-red-600">{money(total)}</span>
             </p>
-            <Button size="lg" onClick={submit} loading={busy} disabled={total <= 0 || blocked}>
+            <Button size="lg" onClick={submit} loading={busy} disabled={total <= 0 || blocked || overDirect}>
               {method === "exchange" ? (
                 <>
                   <Repeat className="size-5" /> متابعة للاستبدال
@@ -294,6 +350,18 @@ export function ReturnsScreen() {
           </Table>
         )}
       </Card>
+
+      <CameraScanner
+        open={showCamera}
+        withQr
+        title="مسح QR أو باركود الفاتورة"
+        onClose={() => setShowCamera(false)}
+        onDetected={(code) => {
+          setShowCamera(false);
+          setInvoice(code);
+          find(code);
+        }}
+      />
 
       {note && (
         <>

@@ -21,6 +21,8 @@ import {
   PackagePlus,
   Wallet,
   HandCoins,
+  BookmarkCheck,
+  BadgePercent,
   X,
 } from "lucide-react";
 import Link from "next/link";
@@ -55,6 +57,8 @@ const NAV: NavItem[] = [
   { href: "/suppliers", label: "الموردون", icon: Truck, roles: M },
   { href: "/expenses", label: "المصروفات", icon: HandCoins, roles: M },
   { href: "/customers", label: "العملاء", icon: Users, roles: ALL },
+  { href: "/reservations", label: "الحجوزات", icon: BookmarkCheck, roles: ALL },
+  { href: "/promotions", label: "العروض والخصومات", icon: BadgePercent, roles: M },
   { href: "/reports", label: "التقارير", icon: BarChart3, roles: M },
   { href: "/users", label: "المستخدمون", icon: UserCog, roles: ["owner"] },
   { href: "/audit", label: "سجل التدقيق", icon: ShieldCheck, roles: ["owner"] },

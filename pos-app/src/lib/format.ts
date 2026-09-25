@@ -55,6 +55,7 @@ export const PAYMENT_LABELS: Record<PaymentMethod, string> = {
   card: "شبكة (مدى/فيزا)",
   transfer: "تحويل بنكي",
   exchange_credit: "رصيد استبدال",
+  on_account: "آجل (على الحساب)",
 };
 
 export const EXPENSE_PAYMENT_LABELS: Record<ExpensePayment, string> = {
@@ -69,6 +70,7 @@ export const REFUND_LABELS: Record<RefundMethod, string> = {
   card: "شبكة",
   transfer: "تحويل",
   exchange: "استبدال (رصيد)",
+  account: "إلى حساب العميل",
 };
 
 export const SALE_STATUS_LABELS: Record<SaleStatus, string> = {

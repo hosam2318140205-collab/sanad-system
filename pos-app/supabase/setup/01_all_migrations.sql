@@ -1,6 +1,6 @@
 -- ملف مُولَّد تلقائياً من supabase/migrations — لا تعدّله يدوياً (npm run db:bundle)
 -- نفّذه مرة واحدة فقط على مشروع Supabase جديد، في SQL Editor.
--- يحتوي: 0001_schema.sql, 0002_triggers_audit.sql, 0003_rls.sql, 0004_functions.sql, 0005_storage_limits.sql, 0006_shifts.sql, 0007_expenses.sql
+-- يحتوي: 0001_schema.sql, 0002_triggers_audit.sql, 0003_rls.sql, 0004_functions.sql, 0005_storage_limits.sql, 0006_shifts.sql, 0007_expenses.sql, 0009_customer_accounts.sql, 0010_promotions_reservations.sql, 0011_sales_v2.sql, 0012_customer_insights.sql
 
 begin;
 
@@ -2190,5 +2190,1841 @@ create policy "expense receipts update" on storage.objects for update to authent
   using (bucket_id = 'expense-receipts' and (storage.foldername(name))[1] = 'expenses' and public.is_manager());
 create policy "expense receipts delete" on storage.objects for delete to authenticated
   using (bucket_id = 'expense-receipts' and (storage.foldername(name))[1] = 'expenses' and public.is_manager());
+
+-- =====================================================================
+-- 0009_customer_accounts.sql
+-- =====================================================================
+-- =====================================================================
+-- Sales & Customers 2.0 — (1) حسابات العملاء: الآجل، التحصيلات، كشف الحساب، نقاط الولاء
+--   • دفتر أستاذ للذمم (customer_ledger) ودفتر للنقاط (loyalty_ledger): إلحاق فقط، ولكل قيد مصدر فريد
+--     (نوع القيد + رقم المستند) فلا يمكن ترحيل نفس المستند مرتين
+--   • الأرصدة المجمّعة في customer_accounts تُحدَّث فقط داخل دوال الترحيل
+--   • التحصيل النقدي من الدرج يُسجَّل تلقائياً كإيداع في وردية الموظف (مثل المصروفات)
+-- إضافة فقط: لا تغيير على جداول أو دوال سابقة
+-- =====================================================================
+
+-- طرق جديدة: البيع الآجل، والإرجاع إلى حساب العميل (تُستخدم في 0011)
+alter type public.payment_method add value if not exists 'on_account';
+alter type public.refund_method add value if not exists 'account';
+
+create type public.ar_entry_type as enum ('sale', 'return', 'receipt', 'refund', 'void', 'adjust');
+create type public.loyalty_entry_type as enum ('earn', 'redeem', 'return_reverse', 'return_restore', 'adjust');
+create type public.collection_method as enum ('cash_drawer', 'cash', 'card', 'transfer');
+create type public.collection_kind as enum ('receipt', 'refund');
+
+alter table public.store_settings
+  add column loyalty_enabled boolean not null default false,
+  add column loyalty_points_per_sar numeric(8,4) not null default 0.1
+    check (loyalty_points_per_sar >= 0 and loyalty_points_per_sar <= 100),
+  add column loyalty_point_value numeric(8,4) not null default 0.1
+    check (loyalty_point_value >= 0 and loyalty_point_value <= 100),
+  add column loyalty_min_redeem integer not null default 50 check (loyalty_min_redeem >= 1),
+  add column loyalty_max_redeem_pct numeric(5,2) not null default 50
+    check (loyalty_max_redeem_pct > 0 and loyalty_max_redeem_pct <= 100),
+  add column allow_cashier_credit boolean not null default false,
+  add column reservation_days integer not null default 3 check (reservation_days between 1 and 60);
+
+-- ---------------------------------------------------------------------
+-- الأرصدة (لكل عميل صف واحد، يُنشأ عند أول حركة أو عند تحديد حد الائتمان)
+--   account_balance > 0 : على العميل للمتجر      < 0 : رصيد دائن للعميل (عربون/مرتجع إلى الحساب)
+--   credit_limit null   : البيع الآجل غير مسموح لهذا العميل
+-- ---------------------------------------------------------------------
+create table public.customer_accounts (
+  customer_id uuid primary key references public.customers (id) on delete restrict,
+  credit_limit numeric(12,2) check (credit_limit is null or credit_limit >= 0),
+  account_balance numeric(12,2) not null default 0,
+  loyalty_points integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+create table public.customer_ledger (
+  id bigint generated always as identity primary key,
+  customer_id uuid not null references public.customers (id) on delete restrict,
+  entry_type public.ar_entry_type not null,
+  source_id uuid not null,
+  ref_no text,
+  debit numeric(12,2) not null default 0 check (debit >= 0),
+  credit numeric(12,2) not null default 0 check (credit >= 0),
+  balance_after numeric(12,2) not null,
+  note text,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  constraint ledger_one_side check ((debit > 0) <> (credit > 0)),
+  -- منع الترحيل المزدوج لنفس المستند
+  constraint ledger_unique_source unique (entry_type, source_id)
+);
+create index customer_ledger_customer_idx on public.customer_ledger (customer_id, created_at, id);
+
+create table public.loyalty_ledger (
+  id bigint generated always as identity primary key,
+  customer_id uuid not null references public.customers (id) on delete restrict,
+  entry_type public.loyalty_entry_type not null,
+  source_id uuid not null,
+  ref_no text,
+  points integer not null check (points <> 0),
+  balance_after integer not null,
+  note text,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  constraint loyalty_unique_source unique (entry_type, source_id)
+);
+create index loyalty_ledger_customer_idx on public.loyalty_ledger (customer_id, created_at, id);
+
+create sequence public.collection_seq start 1;
+
+create table public.customer_payments (
+  id uuid primary key default gen_random_uuid(),
+  receipt_no text not null unique
+    default ('RCP-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.collection_seq')::text, 5, '0')),
+  customer_id uuid not null references public.customers (id) on delete restrict,
+  kind public.collection_kind not null default 'receipt',
+  amount numeric(12,2) not null check (amount > 0),
+  method public.collection_method not null,
+  reference text,
+  notes text,
+  reservation_id uuid,                                   -- عربون حجز (المفتاح يُضاف في 0010)
+  shift_movement_id uuid references public.shift_cash_movements (id),
+  client_ref uuid unique,                                -- مفتاح منع التكرار من الواجهة
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  voided_at timestamptz,
+  voided_by uuid references public.profiles (id),
+  void_reason text
+);
+create index customer_payments_customer_idx on public.customer_payments (customer_id, created_at desc);
+
+-- ---------------------------------------------------------------------
+-- الترحيل (داخلي — تستدعيه الدوال فقط)
+-- ---------------------------------------------------------------------
+create or replace function public._customer_account(p_customer_id uuid)
+returns public.customer_accounts
+language plpgsql security definer set search_path = public as $$
+declare
+  v public.customer_accounts;
+begin
+  insert into public.customer_accounts (customer_id) values (p_customer_id) on conflict do nothing;
+  select * into v from public.customer_accounts where customer_id = p_customer_id for update;
+  return v;
+end;
+$$;
+
+create or replace function public._post_ar(
+  p_customer_id uuid, p_type public.ar_entry_type, p_source_id uuid, p_ref_no text,
+  p_debit numeric, p_credit numeric, p_note text default null
+) returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  v_balance numeric;
+begin
+  if coalesce(p_debit, 0) = 0 and coalesce(p_credit, 0) = 0 then
+    return null;
+  end if;
+  perform public._customer_account(p_customer_id);
+  update public.customer_accounts
+     set account_balance = account_balance + coalesce(p_debit, 0) - coalesce(p_credit, 0), updated_at = now()
+   where customer_id = p_customer_id
+  returning account_balance into v_balance;
+
+  insert into public.customer_ledger (customer_id, entry_type, source_id, ref_no, debit, credit, balance_after, note)
+  values (p_customer_id, p_type, p_source_id, p_ref_no, coalesce(p_debit, 0), coalesce(p_credit, 0), v_balance, p_note);
+  return v_balance;
+end;
+$$;
+
+create or replace function public._post_loyalty(
+  p_customer_id uuid, p_type public.loyalty_entry_type, p_source_id uuid, p_ref_no text,
+  p_points integer, p_note text default null
+) returns integer
+language plpgsql security definer set search_path = public as $$
+declare
+  v_balance integer;
+begin
+  if coalesce(p_points, 0) = 0 then
+    return null;
+  end if;
+  perform public._customer_account(p_customer_id);
+  update public.customer_accounts
+     set loyalty_points = loyalty_points + p_points, updated_at = now()
+   where customer_id = p_customer_id
+  returning loyalty_points into v_balance;
+
+  insert into public.loyalty_ledger (customer_id, entry_type, source_id, ref_no, points, balance_after, note)
+  values (p_customer_id, p_type, p_source_id, p_ref_no, p_points, v_balance, p_note);
+  return v_balance;
+end;
+$$;
+
+revoke all on function public._customer_account(uuid) from public, anon, authenticated;
+revoke all on function public._post_ar(uuid, public.ar_entry_type, uuid, text, numeric, numeric, text) from public, anon, authenticated;
+revoke all on function public._post_loyalty(uuid, public.loyalty_entry_type, uuid, text, integer, text) from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------
+-- التحصيل من العميل / رد رصيد دائن للعميل
+--   p_kind = 'receipt' : العميل يدفع (يُنقص ما عليه، أو يُنشئ رصيداً دائناً كعربون)
+--   p_kind = 'refund'  : المتجر يرد للعميل رصيده الدائن (للمدير فقط، ولا يتجاوز الرصيد الدائن)
+--   الكاشير: من الدرج أو شبكة أو تحويل فقط. «نقداً خارج الدرج» للمدير/المالك.
+-- ---------------------------------------------------------------------
+create or replace function public.record_customer_payment(
+  p_customer_id uuid,
+  p_amount numeric,
+  p_method public.collection_method,
+  p_kind public.collection_kind default 'receipt',
+  p_reference text default null,
+  p_notes text default null,
+  p_client_ref uuid default null,
+  p_reservation_id uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_role public.user_role := public.current_user_role();
+  v_existing public.customer_payments;
+  v_acc public.customer_accounts;
+  v_customer public.customers;
+  v_amount numeric := round(p_amount, 2);
+  v_shift uuid;
+  v_movement uuid;
+  v_id uuid;
+  v_no text;
+begin
+  if v_role is null then
+    raise exception 'غير مصرح';
+  end if;
+
+  -- نفس الطلب أُرسل مرتين (انقطاع شبكة/ضغط مزدوج): نعيد نفس السند دون ترحيل جديد
+  if p_client_ref is not null then
+    select * into v_existing from public.customer_payments where client_ref = p_client_ref;
+    if v_existing.id is not null then
+      if v_existing.created_by is distinct from auth.uid() or v_existing.customer_id <> p_customer_id then
+        raise exception 'مرجع العملية مستخدم مسبقاً';
+      end if;
+      return v_existing.id;
+    end if;
+  end if;
+
+  select * into v_customer from public.customers where id = p_customer_id;
+  if v_customer.id is null then
+    raise exception 'العميل غير موجود';
+  end if;
+  if v_amount is null or v_amount <= 0 then
+    raise exception 'المبلغ غير صحيح';
+  end if;
+  if p_kind = 'refund' and v_role = 'cashier' then
+    raise exception 'رد الرصيد للعميل للمدير فقط';
+  end if;
+  if p_method = 'cash' and v_role = 'cashier' then
+    raise exception 'الكاشير يحصّل نقداً عبر الدرج فقط';
+  end if;
+
+  v_acc := public._customer_account(p_customer_id);   -- قفل حساب العميل حتى نهاية العملية
+  if p_kind = 'refund' and v_amount > -v_acc.account_balance + 0.001 then
+    raise exception 'لا يوجد رصيد دائن كافٍ للعميل (الرصيد الدائن %)', greatest(-v_acc.account_balance, 0);
+  end if;
+
+  insert into public.customer_payments (customer_id, kind, amount, method, reference, notes, client_ref, reservation_id)
+  values (p_customer_id, p_kind, v_amount, p_method, nullif(trim(p_reference), ''), nullif(trim(p_notes), ''),
+          p_client_ref, p_reservation_id)
+  returning id, receipt_no into v_id, v_no;
+
+  if p_method = 'cash_drawer' then
+    select id into v_shift from public.shifts where cashier_id = auth.uid() and status = 'open';
+    if v_shift is null then
+      raise exception 'لا توجد لديك وردية مفتوحة — افتح وردية أو اختر طريقة أخرى';
+    end if;
+    insert into public.shift_cash_movements (shift_id, type, amount, reason)
+    values (v_shift, case when p_kind = 'receipt' then 'in' else 'out' end::public.cash_movement_type, v_amount,
+            case when p_kind = 'receipt' then 'تحصيل ' else 'رد رصيد ' end || v_no || ': ' || v_customer.name)
+    returning id into v_movement;
+    update public.customer_payments set shift_movement_id = v_movement where id = v_id;
+  end if;
+
+  if p_kind = 'receipt' then
+    perform public._post_ar(p_customer_id, 'receipt', v_id, v_no, 0, v_amount, nullif(trim(p_notes), ''));
+  else
+    perform public._post_ar(p_customer_id, 'refund', v_id, v_no, v_amount, 0, nullif(trim(p_notes), ''));
+  end if;
+  return v_id;
+end;
+$$;
+
+-- إلغاء سند (للمدير): قيد عكسي في الدفتر + حركة درج عكسية، والسند يبقى ظاهراً كملغي
+create or replace function public.void_customer_payment(p_payment_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v public.customer_payments;
+  v_shift public.shifts;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'سبب الإلغاء مطلوب';
+  end if;
+  select * into v from public.customer_payments where id = p_payment_id for update;
+  if v.id is null then
+    raise exception 'السند غير موجود';
+  end if;
+  if v.voided_at is not null then
+    raise exception 'السند ملغي مسبقاً';
+  end if;
+
+  if v.shift_movement_id is not null then
+    select s.* into v_shift from public.shift_cash_movements m join public.shifts s on s.id = m.shift_id
+     where m.id = v.shift_movement_id;
+    if v_shift.status = 'closed' then
+      raise exception 'لا يمكن إلغاء سند نقدي من درج وردية مغلقة';
+    end if;
+    insert into public.shift_cash_movements (shift_id, type, amount, reason)
+    values (v_shift.id, case when v.kind = 'receipt' then 'out' else 'in' end::public.cash_movement_type, v.amount,
+            'إلغاء ' || v.receipt_no || ': ' || trim(p_reason));
+  end if;
+
+  perform public._customer_account(v.customer_id);
+  if v.kind = 'receipt' then
+    perform public._post_ar(v.customer_id, 'void', v.id, v.receipt_no, v.amount, 0, 'إلغاء: ' || trim(p_reason));
+  else
+    perform public._post_ar(v.customer_id, 'void', v.id, v.receipt_no, 0, v.amount, 'إلغاء: ' || trim(p_reason));
+  end if;
+
+  update public.customer_payments
+     set voided_at = now(), voided_by = auth.uid(), void_reason = trim(p_reason)
+   where id = v.id;
+end;
+$$;
+
+-- حد الائتمان (null = لا يُسمح بالبيع الآجل)
+create or replace function public.set_credit_limit(p_customer_id uuid, p_limit numeric)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_old numeric;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_limit is not null and p_limit < 0 then
+    raise exception 'حد الائتمان غير صحيح';
+  end if;
+  if not exists (select 1 from public.customers where id = p_customer_id) then
+    raise exception 'العميل غير موجود';
+  end if;
+  select credit_limit into v_old from public._customer_account(p_customer_id);
+  update public.customer_accounts set credit_limit = round(p_limit, 2), updated_at = now()
+   where customer_id = p_customer_id;
+  insert into public.audit_log (table_name, record_id, action, old_data, new_data, changed_fields)
+  values ('customer_accounts', p_customer_id::text, 'UPDATE',
+          jsonb_build_object('credit_limit', v_old), jsonb_build_object('credit_limit', round(p_limit, 2)),
+          array['credit_limit']);
+end;
+$$;
+
+-- تعديل يدوي للنقاط (للمدير) بسبب إلزامي
+create or replace function public.adjust_loyalty(p_customer_id uuid, p_points integer, p_reason text)
+returns integer
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(p_points, 0) = 0 or coalesce(trim(p_reason), '') = '' then
+    raise exception 'أدخل عدد النقاط والسبب';
+  end if;
+  if not exists (select 1 from public.customers where id = p_customer_id) then
+    raise exception 'العميل غير موجود';
+  end if;
+  return public._post_loyalty(p_customer_id, 'adjust', gen_random_uuid(), null, p_points, trim(p_reason));
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- كشف حساب العميل لفترة: رصيد أول المدة + الحركات برصيد تراكمي + رصيد آخر المدة
+-- ---------------------------------------------------------------------
+create or replace function public.customer_statement(p_customer_id uuid, p_from date default null, p_to date default null)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_from timestamptz;
+  v_to timestamptz;
+  v_opening numeric;
+  v_customer public.customers;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into v_customer from public.customers where id = p_customer_id;
+  if v_customer.id is null then
+    raise exception 'العميل غير موجود';
+  end if;
+  v_from := coalesce(p_from, '2000-01-01'::date)::timestamp at time zone 'Asia/Riyadh';
+  v_to := (coalesce(p_to, (now() at time zone 'Asia/Riyadh')::date) + 1)::timestamp at time zone 'Asia/Riyadh';
+
+  select coalesce(sum(debit - credit), 0) into v_opening
+    from public.customer_ledger where customer_id = p_customer_id and created_at < v_from;
+
+  return jsonb_build_object(
+    'customer', jsonb_build_object('id', v_customer.id, 'name', v_customer.name, 'phone', v_customer.phone,
+                                   'vat_number', v_customer.vat_number),
+    'credit_limit', (select credit_limit from public.customer_accounts where customer_id = p_customer_id),
+    'from', p_from,
+    'to', coalesce(p_to, (now() at time zone 'Asia/Riyadh')::date),
+    'opening_balance', v_opening,
+    'entries', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', x.id, 'date', x.created_at, 'type', x.entry_type, 'ref_no', x.ref_no, 'source_id', x.source_id,
+               'debit', x.debit, 'credit', x.credit, 'note', x.note, 'balance', x.balance)
+             order by x.created_at, x.id)
+        from (
+          select e.*, v_opening + sum(e.debit - e.credit) over (order by e.created_at, e.id) as balance
+            from public.customer_ledger e
+           where e.customer_id = p_customer_id and e.created_at >= v_from and e.created_at < v_to) x), '[]'::jsonb),
+    'total_debit', (select coalesce(sum(debit), 0) from public.customer_ledger
+                     where customer_id = p_customer_id and created_at >= v_from and created_at < v_to),
+    'total_credit', (select coalesce(sum(credit), 0) from public.customer_ledger
+                      where customer_id = p_customer_id and created_at >= v_from and created_at < v_to),
+    'closing_balance', v_opening + (select coalesce(sum(debit - credit), 0) from public.customer_ledger
+                                     where customer_id = p_customer_id and created_at >= v_from and created_at < v_to)
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الذمم المدينة وأعمارها (للمدير)
+--   الأعمار بطريقة FIFO: المبلغ المستحق يُنسب لأحدث فواتير الآجل، والتحصيل يسدد الأقدم أولاً
+-- ---------------------------------------------------------------------
+create or replace function public.receivables_report()
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return (
+    with bal as (
+      select a.customer_id, a.account_balance, a.credit_limit
+        from public.customer_accounts a where a.account_balance <> 0
+    ),
+    debits as (
+      select l.customer_id, l.debit, l.created_at,
+             sum(l.debit) over (partition by l.customer_id order by l.created_at desc, l.id desc) as cum
+        from public.customer_ledger l
+        join bal b on b.customer_id = l.customer_id and b.account_balance > 0
+       where l.debit > 0
+    ),
+    open_parts as (
+      select d.customer_id, d.created_at,
+             least(d.debit, greatest(b.account_balance - (d.cum - d.debit), 0)) as open_amount
+        from debits d join bal b on b.customer_id = d.customer_id
+    ),
+    aging as (
+      select customer_id,
+             sum(open_amount) filter (where now() - created_at <= interval '30 days') as d0_30,
+             sum(open_amount) filter (where now() - created_at > interval '30 days' and now() - created_at <= interval '60 days') as d31_60,
+             sum(open_amount) filter (where now() - created_at > interval '60 days' and now() - created_at <= interval '90 days') as d61_90,
+             sum(open_amount) filter (where now() - created_at > interval '90 days') as d90_plus
+        from open_parts group by customer_id
+    ),
+    rows as (
+      select c.id, c.name, c.phone, b.account_balance as balance, b.credit_limit,
+             coalesce(a.d0_30, 0) as d0_30, coalesce(a.d31_60, 0) as d31_60,
+             coalesce(a.d61_90, 0) as d61_90, coalesce(a.d90_plus, 0) as d90_plus,
+             (select max(created_at) from public.customer_payments p
+               where p.customer_id = c.id and p.kind = 'receipt' and p.voided_at is null) as last_payment_at
+        from bal b join public.customers c on c.id = b.customer_id
+         left join aging a on a.customer_id = b.customer_id
+    )
+    select jsonb_build_object(
+      'total_receivable', coalesce((select sum(balance) from rows where balance > 0), 0),
+      'total_credit_balances', coalesce((select -sum(balance) from rows where balance < 0), 0),
+      'd0_30', coalesce((select sum(d0_30) from rows), 0),
+      'd31_60', coalesce((select sum(d31_60) from rows), 0),
+      'd61_90', coalesce((select sum(d61_90) from rows), 0),
+      'd90_plus', coalesce((select sum(d90_plus) from rows), 0),
+      'customers', coalesce((select jsonb_agg(to_jsonb(r) order by r.balance desc) from rows r), '[]'::jsonb)
+    )
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- RLS: الموظفون يقرؤون (الكاشير يحتاج الرصيد والنقاط عند البيع)، والكتابة عبر الدوال فقط
+-- ---------------------------------------------------------------------
+alter table public.customer_accounts enable row level security;
+alter table public.customer_ledger enable row level security;
+alter table public.loyalty_ledger enable row level security;
+alter table public.customer_payments enable row level security;
+
+revoke all on public.customer_accounts, public.customer_ledger, public.loyalty_ledger, public.customer_payments from anon;
+revoke insert, update, delete on public.customer_accounts, public.customer_ledger, public.loyalty_ledger,
+  public.customer_payments from authenticated;
+grant select on public.customer_accounts, public.customer_ledger, public.loyalty_ledger, public.customer_payments
+  to authenticated;
+revoke usage on sequence public.collection_seq from anon;
+
+create policy customer_accounts_select on public.customer_accounts for select to authenticated using (public.is_staff());
+create policy customer_ledger_select on public.customer_ledger for select to authenticated using (public.is_staff());
+create policy loyalty_ledger_select on public.loyalty_ledger for select to authenticated using (public.is_staff());
+create policy customer_payments_select on public.customer_payments for select to authenticated using (public.is_staff());
+
+create trigger customer_payments_audit after insert or update or delete on public.customer_payments
+  for each row execute function public.audit_trigger();
+
+revoke execute on function
+  public.record_customer_payment(uuid, numeric, public.collection_method, public.collection_kind, text, text, uuid, uuid),
+  public.void_customer_payment(uuid, text),
+  public.set_credit_limit(uuid, numeric),
+  public.adjust_loyalty(uuid, integer, text),
+  public.customer_statement(uuid, date, date),
+  public.receivables_report()
+from public, anon;
+grant execute on function
+  public.record_customer_payment(uuid, numeric, public.collection_method, public.collection_kind, text, text, uuid, uuid),
+  public.void_customer_payment(uuid, text),
+  public.set_credit_limit(uuid, numeric),
+  public.adjust_loyalty(uuid, integer, text),
+  public.customer_statement(uuid, date, date),
+  public.receivables_report()
+to authenticated;
+
+-- =====================================================================
+-- 0010_promotions_reservations.sql
+-- =====================================================================
+-- =====================================================================
+-- Sales & Customers 2.0 — (2) العروض والخصومات + حجز المقاسات/الألوان للعملاء
+--   • العروض: نسبة % أو مبلغ لكل قطعة أو «اشترِ X واحصل على Y مجاناً»، على كل الأصناف
+--     أو تصنيف أو منتج، بفترة صلاحية، ومع رمز كوبون اختياري. التطبيق يتم في الخادم (0011)
+--   • الحجز: لكل صنف (منتج + مقاس + لون) كمية محجوزة لعميل حتى تاريخ انتهاء؛ الكمية المحجوزة
+--     لا تُباع لغيره، والمخزون نفسه لا يتحرك إلا عند البيع الفعلي
+-- إضافة فقط
+-- =====================================================================
+
+create type public.promo_kind as enum ('percent', 'amount', 'bxgy');
+create type public.promo_scope as enum ('all', 'category', 'product');
+create type public.reservation_status as enum ('active', 'fulfilled', 'cancelled');
+
+create table public.promotions (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (length(trim(name)) > 0),
+  kind public.promo_kind not null,
+  value numeric(12,2) not null default 0,         -- percent: النسبة، amount: المبلغ لكل قطعة
+  buy_qty integer,                                -- bxgy
+  get_qty integer,                                -- bxgy
+  scope public.promo_scope not null default 'all',
+  category_id uuid references public.categories (id) on delete cascade,
+  product_id uuid references public.products (id) on delete cascade,
+  min_qty integer not null default 1 check (min_qty >= 1),
+  code text,                                      -- كوبون اختياري: العرض لا يُطبق إلا بإدخاله
+  starts_at timestamptz,
+  ends_at timestamptz,
+  is_active boolean not null default true,
+  notes text,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint promo_value check (
+    (kind = 'percent' and value > 0 and value <= 100)
+    or (kind = 'amount' and value > 0)
+    or (kind = 'bxgy' and coalesce(buy_qty, 0) >= 1 and coalesce(get_qty, 0) >= 1)),
+  constraint promo_scope_target check (
+    (scope = 'all') or (scope = 'category' and category_id is not null) or (scope = 'product' and product_id is not null)),
+  constraint promo_dates check (starts_at is null or ends_at is null or ends_at > starts_at),
+  constraint promo_code_format check (code is null or code ~ '^[A-Z0-9_-]{3,30}$')
+);
+create unique index promotions_code_idx on public.promotions (code) where code is not null;
+create trigger promotions_touch before update on public.promotions
+  for each row execute function public.touch_updated_at();
+
+-- الكوبون يُخزَّن بحروف كبيرة
+create or replace function public.promotions_normalize()
+returns trigger language plpgsql as $$
+begin
+  new.code := nullif(upper(trim(new.code)), '');
+  if new.scope <> 'category' then new.category_id := null; end if;
+  if new.scope <> 'product' then new.product_id := null; end if;
+  if new.kind <> 'bxgy' then new.buy_qty := null; new.get_qty := null; end if;
+  if new.kind = 'bxgy' then new.value := 0; end if;
+  return new;
+end;
+$$;
+create trigger promotions_normalize before insert or update on public.promotions
+  for each row execute function public.promotions_normalize();
+
+-- ---------------------------------------------------------------------
+-- الحجوزات
+-- ---------------------------------------------------------------------
+create sequence public.reservation_seq start 1;
+
+create table public.reservations (
+  id uuid primary key default gen_random_uuid(),
+  reservation_no text not null unique
+    default ('RSV-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.reservation_seq')::text, 5, '0')),
+  customer_id uuid not null references public.customers (id) on delete restrict,
+  status public.reservation_status not null default 'active',
+  expires_at timestamptz not null,
+  notes text,
+  sale_id uuid references public.sales (id),
+  client_ref uuid unique,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  closed_at timestamptz,
+  closed_by uuid references public.profiles (id),
+  cancel_reason text
+);
+create index reservations_customer_idx on public.reservations (customer_id, created_at desc);
+create index reservations_active_idx on public.reservations (expires_at) where status = 'active';
+
+create table public.reservation_items (
+  id uuid primary key default gen_random_uuid(),
+  reservation_id uuid not null references public.reservations (id) on delete cascade,
+  variant_id uuid not null references public.product_variants (id),
+  qty integer not null check (qty > 0),
+  unique (reservation_id, variant_id)
+);
+create index reservation_items_variant_idx on public.reservation_items (variant_id);
+
+-- عربون الحجز = سند تحصيل مرتبط بالحجز (يُضاف لرصيد العميل الدائن ويُستخدم عند الاستلام)
+alter table public.customer_payments
+  add constraint customer_payments_reservation_fk foreign key (reservation_id) references public.reservations (id);
+
+create or replace function public.customer_payment_reservation_check()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.reservation_id is not null and not exists (
+    select 1 from public.reservations where id = new.reservation_id and customer_id = new.customer_id
+  ) then
+    raise exception 'الحجز لا يخص هذا العميل';
+  end if;
+  return new;
+end;
+$$;
+create trigger customer_payments_reservation_check before insert on public.customer_payments
+  for each row execute function public.customer_payment_reservation_check();
+
+-- الكمية المحجوزة فعلياً (حجوزات نشطة لم تنتهِ)، مع استثناء حجز معين (عند استلامه)
+create or replace function public._reserved_qty(p_variant_id uuid, p_exclude uuid default null)
+returns integer
+language sql stable security definer set search_path = public as $$
+  select coalesce(sum(i.qty), 0)::integer
+    from public.reservation_items i
+    join public.reservations r on r.id = i.reservation_id
+   where i.variant_id = p_variant_id and r.status = 'active' and r.expires_at > now()
+     and (p_exclude is null or r.id <> p_exclude)
+$$;
+revoke all on function public._reserved_qty(uuid, uuid) from public, anon, authenticated;
+
+-- للعرض في نقطة البيع: الكميات المحجوزة لكل صنف
+create or replace function public.reserved_quantities()
+returns table (variant_id uuid, reserved integer)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+    select i.variant_id, sum(i.qty)::integer
+      from public.reservation_items i
+      join public.reservations r on r.id = i.reservation_id
+     where r.status = 'active' and r.expires_at > now()
+     group by i.variant_id;
+end;
+$$;
+
+-- p_items: [{"variant_id": uuid, "qty": int}]
+create or replace function public.create_reservation(
+  p_customer_id uuid,
+  p_items jsonb,
+  p_days integer default null,
+  p_notes text default null,
+  p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.store_settings;
+  v_existing public.reservations;
+  v_id uuid;
+  v_line record;
+  v_available integer;
+  v_days integer;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into s from public.store_settings where id = 1;
+
+  if p_client_ref is not null then
+    select * into v_existing from public.reservations where client_ref = p_client_ref;
+    if v_existing.id is not null then
+      if v_existing.created_by is distinct from auth.uid() then
+        raise exception 'مرجع العملية مستخدم مسبقاً';
+      end if;
+      return v_existing.id;
+    end if;
+  end if;
+
+  if not exists (select 1 from public.customers where id = p_customer_id) then
+    raise exception 'اختر العميل';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'لم يتم اختيار أصناف للحجز';
+  end if;
+  v_days := coalesce(p_days, s.reservation_days);
+  if v_days < 1 or v_days > 60 then
+    raise exception 'مدة الحجز بين 1 و60 يوماً';
+  end if;
+
+  insert into public.reservations (customer_id, expires_at, notes, client_ref)
+  values (p_customer_id, now() + make_interval(days => v_days), nullif(trim(p_notes), ''), p_client_ref)
+  returning id into v_id;
+
+  -- نجمع الصنف المكرر، ونقفل صفوف الأصناف لمنع حجزين متزامنين لنفس القطعة
+  for v_line in
+    select (e ->> 'variant_id')::uuid as variant_id, sum((e ->> 'qty')::integer)::integer as qty
+      from jsonb_array_elements(p_items) e group by 1 order by 1
+  loop
+    if v_line.qty is null or v_line.qty <= 0 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+    perform 1 from public.product_variants v join public.products p on p.id = v.product_id
+     where v.id = v_line.variant_id and v.is_active and p.is_active for update of v;
+    if not found then
+      raise exception 'صنف غير موجود أو موقوف';
+    end if;
+    select v.stock_qty - public._reserved_qty(v.id) into v_available
+      from public.product_variants v where v.id = v_line.variant_id;
+    if v_line.qty > v_available then
+      raise exception 'المتاح للحجز من الصنف % هو % فقط',
+        (select sku from public.product_variants where id = v_line.variant_id), greatest(v_available, 0);
+    end if;
+    insert into public.reservation_items (reservation_id, variant_id, qty) values (v_id, v_line.variant_id, v_line.qty);
+  end loop;
+
+  return v_id;
+end;
+$$;
+
+-- إلغاء: الكاشير لحجوزاته فقط، والمدير لأي حجز. العربون يبقى رصيداً دائناً للعميل
+create or replace function public.cancel_reservation(p_reservation_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v public.reservations;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'سبب الإلغاء مطلوب';
+  end if;
+  select * into v from public.reservations where id = p_reservation_id for update;
+  if v.id is null then
+    raise exception 'الحجز غير موجود';
+  end if;
+  if v.status <> 'active' then
+    raise exception 'الحجز ليس نشطاً';
+  end if;
+  if not public.is_manager() and v.created_by is distinct from auth.uid() then
+    raise exception 'الكاشير يلغي حجوزاته فقط';
+  end if;
+  update public.reservations
+     set status = 'cancelled', closed_at = now(), closed_by = auth.uid(), cancel_reason = trim(p_reason)
+   where id = v.id;
+end;
+$$;
+
+-- تمديد حجز نشط (ويُعاد التحقق من التوفر إن كان قد انتهى)
+create or replace function public.extend_reservation(p_reservation_id uuid, p_days integer)
+returns timestamptz
+language plpgsql security definer set search_path = public as $$
+declare
+  v public.reservations;
+  v_line record;
+  v_new timestamptz;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_days is null or p_days < 1 or p_days > 60 then
+    raise exception 'مدة التمديد بين 1 و60 يوماً';
+  end if;
+  select * into v from public.reservations where id = p_reservation_id for update;
+  if v.id is null or v.status <> 'active' then
+    raise exception 'الحجز ليس نشطاً';
+  end if;
+  if v.expires_at <= now() then
+    for v_line in select i.variant_id, i.qty from public.reservation_items i where i.reservation_id = v.id loop
+      perform 1 from public.product_variants where id = v_line.variant_id for update;
+      if v_line.qty > (select stock_qty from public.product_variants where id = v_line.variant_id)
+                      - public._reserved_qty(v_line.variant_id, v.id) then
+        raise exception 'انتهى الحجز والكمية لم تعد متاحة';
+      end if;
+    end loop;
+  end if;
+  v_new := greatest(v.expires_at, now()) + make_interval(days => p_days);
+  update public.reservations set expires_at = v_new where id = v.id;
+  return v_new;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- RLS
+-- ---------------------------------------------------------------------
+alter table public.promotions enable row level security;
+alter table public.reservations enable row level security;
+alter table public.reservation_items enable row level security;
+
+revoke all on public.promotions, public.reservations, public.reservation_items from anon;
+revoke usage on sequence public.reservation_seq from anon;
+grant select, insert, update, delete on public.promotions to authenticated;
+revoke insert, update, delete on public.reservations, public.reservation_items from authenticated;
+grant select on public.reservations, public.reservation_items to authenticated;
+
+create policy promotions_select on public.promotions for select to authenticated using (public.is_staff());
+create policy promotions_write on public.promotions for all to authenticated
+  using (public.is_manager()) with check (public.is_manager());
+create policy reservations_select on public.reservations for select to authenticated using (public.is_staff());
+create policy reservation_items_select on public.reservation_items for select to authenticated using (public.is_staff());
+
+create trigger promotions_audit after insert or update or delete on public.promotions
+  for each row execute function public.audit_trigger();
+create trigger reservations_audit after insert or update or delete on public.reservations
+  for each row execute function public.audit_trigger();
+
+revoke execute on function
+  public.reserved_quantities(),
+  public.create_reservation(uuid, jsonb, integer, text, uuid),
+  public.cancel_reservation(uuid, text),
+  public.extend_reservation(uuid, integer)
+from public, anon;
+grant execute on function
+  public.reserved_quantities(),
+  public.create_reservation(uuid, jsonb, integer, text, uuid),
+  public.cancel_reservation(uuid, text),
+  public.extend_reservation(uuid, integer)
+to authenticated;
+revoke execute on function public.promotions_normalize(), public.customer_payment_reservation_check() from public, anon;
+
+-- =====================================================================
+-- 0011_sales_v2.sql
+-- =====================================================================
+-- =====================================================================
+-- Sales & Customers 2.0 — (3) البيع 2.0
+--   • تسعير السلة في الخادم فقط (_price_cart): العروض، الكوبون، خصم الكاشير، استبدال النقاط، الضريبة.
+--     نفس الدالة تُستخدم للمعاينة في الشاشة ولإتمام البيع، فلا يختلف ما يراه الكاشير عمّا يُحفظ
+--   • complete_sale بمعاملات إضافية اختيارية (التوافق الكامل مع الاستدعاءات السابقة):
+--       p_client_ref     : مفتاح منع التكرار — نفس المفتاح يعيد نفس الفاتورة ولا يُنشئ أخرى
+--       p_promo_code     : كوبون
+--       p_redeem_points  : نقاط تُستبدل كخصم (الضريبة تُحسب بعد الخصم وفق قواعد الهيئة)
+--       p_reservation_id : استلام حجز
+--     والدفع «آجل» (on_account) لعميل ضمن حد ائتمانه، مع قيد في دفتر الذمم
+--   • المرتجع: «إلى حساب العميل» يُنقص الذمة، ونقاط الفاتورة تُعكس بنسبة المرتجع — عبر trigger
+--     دون تعديل process_return
+--   • رمز عام لكل فاتورة (public_token) لعرضها للعميل واسترجاعها بالـ QR في المرتجع/الاستبدال
+-- =====================================================================
+
+alter table public.sales
+  add column client_ref uuid unique,
+  add column promo_code text,
+  add column promo_discount numeric(12,2) not null default 0,
+  add column loyalty_points_redeemed integer not null default 0,
+  add column loyalty_discount numeric(12,2) not null default 0,     -- بأساس السعر (مثل بقية الخصومات)
+  add column loyalty_points_earned integer not null default 0,
+  add column reservation_id uuid references public.reservations (id),
+  add column public_token text not null unique default replace(gen_random_uuid()::text, '-', '');
+
+alter table public.sale_items
+  add column promo_discount numeric(12,2) not null default 0,       -- جزء من line_discount
+  add column promotion_id uuid references public.promotions (id) on delete set null;
+
+grant select (promo_discount, promotion_id) on public.sale_items to authenticated;
+
+-- ---------------------------------------------------------------------
+-- تقييم عرض واحد على أسطر السلة التي لم يأخذها عرض آخر
+--   يعيد: {"total": n, "alloc": [خصم كل سطر], "consumed": [هل السطر محجوز لهذا العرض]}
+-- ---------------------------------------------------------------------
+create or replace function public._promo_eval(p public.promotions, p_lines jsonb, p_taken boolean[])
+returns jsonb
+language plpgsql immutable set search_path = public as $$
+declare
+  n integer := jsonb_array_length(p_lines);
+  v_alloc numeric[] := array_fill(0::numeric, array[n]);
+  v_cons boolean[] := array_fill(false, array[n]);
+  v_units integer := 0;
+  v_free integer;
+  v_take integer;
+  v_total numeric := 0;
+  v_line jsonb;
+  i integer;
+  r record;
+begin
+  for i in 1 .. n loop
+    v_line := p_lines -> (i - 1);
+    if not p_taken[i] and (
+         p.scope = 'all'
+      or (p.scope = 'category' and (v_line ->> 'category_id')::uuid = p.category_id)
+      or (p.scope = 'product' and (v_line ->> 'product_id')::uuid = p.product_id)) then
+      v_cons[i] := true;
+      v_units := v_units + (v_line ->> 'qty')::integer;
+    end if;
+  end loop;
+
+  if v_units = 0 or v_units < p.min_qty then
+    return jsonb_build_object('total', 0);
+  end if;
+
+  if p.kind = 'bxgy' then
+    v_free := (v_units / (p.buy_qty + p.get_qty)) * p.get_qty;
+    if v_free = 0 then
+      return jsonb_build_object('total', 0);
+    end if;
+    -- القطع المجانية = الأرخص بين الأصناف المشمولة
+    for r in
+      select (x.ord)::integer as idx, (x.l ->> 'qty')::integer as qty, (x.l ->> 'unit_price')::numeric as price
+        from jsonb_array_elements(p_lines) with ordinality as x(l, ord)
+       order by (x.l ->> 'unit_price')::numeric, x.ord
+    loop
+      exit when v_free = 0;
+      if v_cons[r.idx] then
+        v_take := least(r.qty, v_free);
+        v_alloc[r.idx] := round(v_take * r.price, 2);
+        v_free := v_free - v_take;
+      end if;
+    end loop;
+  else
+    for i in 1 .. n loop
+      if v_cons[i] then
+        v_line := p_lines -> (i - 1);
+        if p.kind = 'percent' then
+          v_alloc[i] := round((v_line ->> 'gross')::numeric * p.value / 100, 2);
+        else
+          v_alloc[i] := least(round(p.value * (v_line ->> 'qty')::integer, 2), (v_line ->> 'gross')::numeric);
+        end if;
+      end if;
+    end loop;
+    -- عروض النسبة/المبلغ لا تحجز إلا الأسطر التي خُصم منها فعلاً
+    for i in 1 .. n loop
+      v_cons[i] := v_cons[i] and v_alloc[i] > 0;
+    end loop;
+  end if;
+
+  for i in 1 .. n loop
+    v_total := v_total + v_alloc[i];
+  end loop;
+  return jsonb_build_object('total', v_total, 'alloc', to_jsonb(v_alloc), 'consumed', to_jsonb(v_cons));
+end;
+$$;
+revoke all on function public._promo_eval(public.promotions, jsonb, boolean[]) from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------
+-- تسعير السلة (داخلي). لا يكتب شيئاً.
+-- ترتيب الخصومات على كل سطر: العرض (الأفضل للعميل، بلا تراكب عروض) ← خصم الكاشير على السطر
+-- ثم على الفاتورة: خصم الكاشير + قيمة النقاط، موزعة على الأسطر نسبياً، ثم الضريبة لكل سطر
+-- ---------------------------------------------------------------------
+create or replace function public._price_cart(
+  p_items jsonb,
+  p_invoice_discount numeric,
+  p_promo_code text,
+  p_redeem_points integer,
+  p_customer_id uuid,
+  p_role public.user_role
+) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  s public.store_settings;
+  v_item jsonb;
+  v_variant record;
+  v_lines jsonb := '[]'::jsonb;
+  v_line jsonb;
+  n integer;
+  i integer;
+  v_qty integer;
+  v_code text := nullif(upper(trim(p_promo_code)), '');
+  v_code_applied boolean := false;
+  v_taken boolean[];
+  v_promo public.promotions;
+  v_eval jsonb;
+  v_best jsonb;
+  v_best_promo public.promotions;
+  v_best_total numeric;
+  v_applied jsonb := '[]'::jsonb;
+  v_gross numeric;
+  v_promo_amt numeric;
+  v_disc numeric;
+  v_sum_gross numeric := 0;
+  v_sum_promo numeric := 0;
+  v_sum_manual numeric := 0;
+  v_base numeric;
+  v_inv_disc numeric;
+  v_points integer := greatest(coalesce(p_redeem_points, 0), 0);
+  v_loyalty_value numeric := 0;
+  v_loyalty_base numeric := 0;
+  v_loyalty_cap numeric;
+  v_alloc_total numeric;
+  v_alloc numeric;
+  v_alloc_done numeric := 0;
+  v_net numeric;
+  v_line_total numeric;
+  v_line_vat numeric;
+  v_total numeric := 0;
+  v_vat numeric := 0;
+begin
+  select * into s from public.store_settings where id = 1;
+
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'السلة فارغة';
+  end if;
+
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    v_qty := (v_item ->> 'qty')::integer;
+    if v_qty is null or v_qty <= 0 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+    select v.id, v.sku, v.size, v.color, coalesce(v.price, p.base_price) as price, p.name, p.id as product_id,
+           p.category_id, v.is_active and p.is_active as active, coalesce(c.cost_price, 0) as cost
+      into v_variant
+      from public.product_variants v
+      join public.products p on p.id = v.product_id
+      left join public.variant_costs c on c.variant_id = v.id
+     where v.id = (v_item ->> 'variant_id')::uuid;
+    if v_variant.id is null then
+      raise exception 'صنف غير موجود';
+    end if;
+    if not v_variant.active then
+      raise exception 'الصنف % موقوف', v_variant.sku;
+    end if;
+    v_lines := v_lines || jsonb_build_object(
+      'variant_id', v_variant.id, 'sku', v_variant.sku, 'product_name', v_variant.name,
+      'variant_label', nullif(concat_ws(' / ', v_variant.size, v_variant.color), ''),
+      'product_id', v_variant.product_id, 'category_id', v_variant.category_id,
+      'qty', v_qty, 'unit_price', v_variant.price, 'gross', round(v_variant.price * v_qty, 2),
+      'manual', greatest(coalesce((v_item ->> 'discount')::numeric, 0), 0), 'cost', v_variant.cost,
+      'promo', 0, 'promotion_id', null);
+  end loop;
+  n := jsonb_array_length(v_lines);
+  v_taken := array_fill(false, array[n]);
+
+  -- الكوبون يجب أن يكون صالحاً الآن
+  if v_code is not null and not exists (
+    select 1 from public.promotions
+     where code = v_code and is_active
+       and (starts_at is null or starts_at <= now()) and (ends_at is null or ends_at > now())) then
+    raise exception 'رمز الخصم «%» غير صالح أو منتهي الصلاحية', v_code;
+  end if;
+
+  -- اختيار العروض: كل جولة تأخذ العرض الأكبر خصماً على الأسطر المتبقية (بلا تراكب على نفس السطر)
+  loop
+    v_best := null;
+    v_best_total := 0;
+    for v_promo in
+      select * from public.promotions
+       where is_active
+         and (starts_at is null or starts_at <= now()) and (ends_at is null or ends_at > now())
+         and (code is null or code = v_code)
+       order by created_at, id
+    loop
+      v_eval := public._promo_eval(v_promo, v_lines, v_taken);
+      if (v_eval ->> 'total')::numeric > v_best_total then
+        v_best := v_eval;
+        v_best_total := (v_eval ->> 'total')::numeric;
+        v_best_promo := v_promo;
+      end if;
+    end loop;
+    exit when v_best is null;
+
+    for i in 1 .. n loop
+      if (v_best -> 'consumed' ->> (i - 1))::boolean then
+        v_taken[i] := true;
+        v_lines := jsonb_set(v_lines, array[(i - 1)::text], (v_lines -> (i - 1)) || jsonb_build_object(
+          'promo', (v_best -> 'alloc' ->> (i - 1))::numeric,
+          'promotion_id', case when (v_best -> 'alloc' ->> (i - 1))::numeric > 0 then v_best_promo.id end));
+      end if;
+    end loop;
+    v_applied := v_applied || jsonb_build_object('id', v_best_promo.id, 'name', v_best_promo.name,
+                                                 'code', v_best_promo.code, 'discount', v_best_total);
+    if v_best_promo.code is not null then
+      v_code_applied := true;
+    end if;
+  end loop;
+
+  -- خصم الكاشير على السطر: لا يتجاوز ما بقي بعد العرض
+  for i in 0 .. n - 1 loop
+    v_line := v_lines -> i;
+    v_gross := (v_line ->> 'gross')::numeric;
+    v_promo_amt := (v_line ->> 'promo')::numeric;
+    v_disc := round(least((v_line ->> 'manual')::numeric, v_gross - v_promo_amt), 2);
+    v_lines := jsonb_set(v_lines, array[i::text], v_line || jsonb_build_object('manual', v_disc));
+    v_sum_gross := v_sum_gross + v_gross;
+    v_sum_promo := v_sum_promo + v_promo_amt;
+    v_sum_manual := v_sum_manual + v_disc;
+  end loop;
+
+  v_base := v_sum_gross - v_sum_promo - v_sum_manual;
+  v_inv_disc := round(least(greatest(coalesce(p_invoice_discount, 0), 0), v_base), 2);
+
+  -- حد الخصم للكاشير: يشمل خصوماته اليدوية فقط (العروض والنقاط خصومات النظام)
+  if p_role = 'cashier' and v_sum_gross > 0
+     and (v_sum_manual + v_inv_disc) / v_sum_gross * 100 > s.max_cashier_discount_pct + 0.001 then
+    raise exception 'الخصم يتجاوز الحد المسموح للكاشير (% %%)', s.max_cashier_discount_pct;
+  end if;
+
+  -- استبدال النقاط
+  if v_points > 0 then
+    if not s.loyalty_enabled then
+      raise exception 'برنامج الولاء غير مفعّل';
+    end if;
+    if p_customer_id is null then
+      raise exception 'اختر العميل لاستبدال النقاط';
+    end if;
+    if v_points < s.loyalty_min_redeem then
+      raise exception 'الحد الأدنى للاستبدال % نقطة', s.loyalty_min_redeem;
+    end if;
+    if v_points > coalesce((select loyalty_points from public.customer_accounts where customer_id = p_customer_id), 0) then
+      raise exception 'رصيد النقاط غير كافٍ';
+    end if;
+    v_loyalty_value := round(v_points * s.loyalty_point_value, 2);
+    v_loyalty_base := case when s.prices_include_vat then v_loyalty_value
+                           else round(v_loyalty_value * 100 / (100 + s.vat_rate), 2) end;
+    v_loyalty_cap := round((v_base - v_inv_disc) * s.loyalty_max_redeem_pct / 100, 2);
+    if v_loyalty_base > v_loyalty_cap + 0.001 then
+      raise exception 'قيمة النقاط (% ر.س) تتجاوز الحد المسموح (% %% من الفاتورة)', v_loyalty_value, s.loyalty_max_redeem_pct;
+    end if;
+  end if;
+
+  -- توزيع خصم الفاتورة + النقاط على الأسطر، ثم الضريبة (نفس خوارزمية complete_sale السابقة)
+  v_alloc_total := v_inv_disc + v_loyalty_base;
+  for i in 0 .. n - 1 loop
+    v_line := v_lines -> i;
+    v_net := (v_line ->> 'gross')::numeric - (v_line ->> 'promo')::numeric - (v_line ->> 'manual')::numeric;
+    if i = n - 1 then
+      v_alloc := v_alloc_total - v_alloc_done;
+    elsif v_base > 0 then
+      v_alloc := round(v_alloc_total * v_net / v_base, 2);
+    else
+      v_alloc := 0;
+    end if;
+    v_alloc_done := v_alloc_done + v_alloc;
+    v_net := v_net - v_alloc;
+
+    if s.prices_include_vat then
+      v_line_total := round(v_net, 2);
+      v_line_vat := round(v_net * s.vat_rate / (100 + s.vat_rate), 2);
+    else
+      v_line_vat := round(v_net * s.vat_rate / 100, 2);
+      v_line_total := round(v_net, 2) + v_line_vat;
+    end if;
+    v_total := v_total + v_line_total;
+    v_vat := v_vat + v_line_vat;
+    v_lines := jsonb_set(v_lines, array[i::text], v_line || jsonb_build_object(
+      'line_discount', (v_line ->> 'manual')::numeric + (v_line ->> 'promo')::numeric + v_alloc,
+      'line_total', v_line_total,
+      'vat', v_line_vat));
+  end loop;
+
+  return jsonb_build_object(
+    'lines', v_lines,
+    'gross', v_sum_gross,
+    'promo_discount', v_sum_promo,
+    'manual_discount', v_sum_manual,
+    'invoice_discount', v_inv_disc,
+    'loyalty_points', v_points,
+    'loyalty_value', v_loyalty_value,
+    'loyalty_discount', v_loyalty_base,
+    'discount_total', v_sum_promo + v_sum_manual + v_inv_disc + v_loyalty_base,
+    'subtotal', v_total - v_vat,
+    'vat', v_vat,
+    'total', v_total,
+    'promotions', v_applied,
+    'promo_code', v_code,
+    'promo_code_applied', v_code_applied
+  );
+end;
+$$;
+revoke all on function public._price_cart(jsonb, numeric, text, integer, uuid, public.user_role) from public, anon, authenticated;
+
+-- معاينة السلة للشاشة (نفس حسابات إتمام البيع) + ما يحتاجه الكاشير عن العميل
+create or replace function public.price_cart(
+  p_items jsonb,
+  p_invoice_discount numeric default 0,
+  p_promo_code text default null,
+  p_redeem_points integer default 0,
+  p_customer_id uuid default null
+) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_role public.user_role := public.current_user_role();
+  s public.store_settings;
+  v_acc public.customer_accounts;
+  v_result jsonb;
+begin
+  if v_role is null then
+    raise exception 'غير مصرح';
+  end if;
+  select * into s from public.store_settings where id = 1;
+  v_result := public._price_cart(p_items, p_invoice_discount, p_promo_code, p_redeem_points, p_customer_id, v_role);
+  if p_customer_id is not null then
+    select * into v_acc from public.customer_accounts where customer_id = p_customer_id;
+    v_result := v_result || jsonb_build_object('customer', jsonb_build_object(
+      'loyalty_points', coalesce(v_acc.loyalty_points, 0),
+      'account_balance', coalesce(v_acc.account_balance, 0),
+      'credit_limit', v_acc.credit_limit,
+      'credit_available', greatest(coalesce(v_acc.credit_limit, 0) - coalesce(v_acc.account_balance, 0), 0),
+      'can_use_credit', (v_role <> 'cashier' or s.allow_cashier_credit)
+    ));
+  end if;
+  -- قطع لا يمكن بيعها لأنها محجوزة لعملاء آخرين
+  return v_result || jsonb_build_object('reserved', coalesce((
+    select jsonb_object_agg(l ->> 'variant_id', public._reserved_qty((l ->> 'variant_id')::uuid))
+      from jsonb_array_elements(v_result -> 'lines') l
+     where public._reserved_qty((l ->> 'variant_id')::uuid) > 0), '{}'::jsonb));
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- إتمام البيع 2.0 — يحل محل النسخة السابقة بنفس المعاملات الخمسة الأولى
+-- ---------------------------------------------------------------------
+drop function public.complete_sale(jsonb, jsonb, uuid, numeric, text);
+
+create or replace function public.complete_sale(
+  p_items jsonb,
+  p_payments jsonb,
+  p_customer_id uuid default null,
+  p_invoice_discount numeric default 0,
+  p_notes text default null,
+  p_client_ref uuid default null,
+  p_promo_code text default null,
+  p_redeem_points integer default 0,
+  p_reservation_id uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_role public.user_role := public.current_user_role();
+  s public.store_settings;
+  v_existing public.sales;
+  v_res public.reservations;
+  v_customer uuid := p_customer_id;
+  v_acc public.customer_accounts;
+  v_price jsonb;
+  v_line jsonb;
+  v_pay jsonb;
+  v_sale_id uuid;
+  v_invoice_no text;
+  v_total numeric;
+  v_paid numeric := 0;
+  v_noncash numeric := 0;
+  v_on_account numeric := 0;
+  v_exchange numeric := 0;
+  v_change numeric;
+  v_method public.payment_method;
+  v_amount numeric;
+  v_return public.returns;
+  v_points integer := greatest(coalesce(p_redeem_points, 0), 0);
+  v_earn integer := 0;
+  v_available integer;
+begin
+  if v_role is null then
+    raise exception 'غير مصرح';
+  end if;
+  select * into s from public.store_settings where id = 1;
+
+  -- منع الترحيل المزدوج: نفس المفتاح = نفس الفاتورة
+  if p_client_ref is not null then
+    select * into v_existing from public.sales where client_ref = p_client_ref;
+    if v_existing.id is not null then
+      if v_existing.cashier_id is distinct from auth.uid() then
+        raise exception 'مرجع العملية مستخدم مسبقاً';
+      end if;
+      return v_existing.id;
+    end if;
+  end if;
+
+  -- استلام حجز
+  if p_reservation_id is not null then
+    select * into v_res from public.reservations where id = p_reservation_id for update;
+    if v_res.id is null or v_res.status <> 'active' then
+      raise exception 'الحجز غير موجود أو تم إغلاقه';
+    end if;
+    if v_customer is null then
+      v_customer := v_res.customer_id;
+    elsif v_customer <> v_res.customer_id then
+      raise exception 'الحجز لعميل آخر';
+    end if;
+  end if;
+
+  if v_customer is not null and not exists (select 1 from public.customers where id = v_customer) then
+    raise exception 'العميل غير موجود';
+  end if;
+  -- قفل حساب العميل قبل التحقق من النقاط/الائتمان
+  if v_customer is not null then
+    v_acc := public._customer_account(v_customer);
+  end if;
+
+  v_price := public._price_cart(p_items, p_invoice_discount, p_promo_code, v_points, v_customer, v_role);
+  v_total := (v_price ->> 'total')::numeric;
+
+  -- الكميات المحجوزة لعملاء آخرين لا تُباع
+  if not s.allow_negative_stock then
+    for v_line in
+      select jsonb_build_object('variant_id', l ->> 'variant_id', 'sku', min(l ->> 'sku'), 'qty', sum((l ->> 'qty')::integer))
+        from jsonb_array_elements(v_price -> 'lines') l group by l ->> 'variant_id'
+    loop
+      select stock_qty - public._reserved_qty(id, p_reservation_id) into v_available
+        from public.product_variants where id = (v_line ->> 'variant_id')::uuid for update;
+      if (v_line ->> 'qty')::integer > v_available then
+        raise exception 'المتاح من الصنف % هو % فقط (الباقي محجوز لعملاء)', v_line ->> 'sku', greatest(v_available, 0);
+      end if;
+    end loop;
+  end if;
+
+  -- الدفعات
+  if p_payments is null or jsonb_typeof(p_payments) <> 'array' or jsonb_array_length(p_payments) = 0 then
+    raise exception 'لم يتم تحديد طريقة الدفع';
+  end if;
+  for v_pay in select * from jsonb_array_elements(p_payments) loop
+    v_method := (v_pay ->> 'method')::public.payment_method;
+    v_amount := round((v_pay ->> 'amount')::numeric, 2);
+    if v_amount is null or v_amount <= 0 then
+      raise exception 'مبلغ دفع غير صحيح';
+    end if;
+    if v_method = 'exchange_credit' then
+      select * into v_return from public.returns where id = (v_pay ->> 'return_id')::uuid for update;
+      if v_return.id is null or v_return.refund_method <> 'exchange' then
+        raise exception 'رصيد الاستبدال غير صالح';
+      end if;
+      if v_return.credit_used_by_sale is not null then
+        raise exception 'رصيد الاستبدال % مستخدم مسبقاً', v_return.return_no;
+      end if;
+      if v_amount <> v_return.total then
+        raise exception 'يجب استخدام رصيد الاستبدال كاملاً (% ر.س)', v_return.total;
+      end if;
+      v_exchange := v_exchange + v_amount;
+    elsif v_method = 'on_account' then
+      v_on_account := v_on_account + v_amount;
+    end if;
+    if v_method = 'cash' then
+      null;
+    else
+      v_noncash := v_noncash + v_amount;
+    end if;
+    v_paid := v_paid + v_amount;
+  end loop;
+
+  if v_noncash > v_total + 0.001 then
+    raise exception 'مبالغ الشبكة/التحويل/الاستبدال/الآجل (% ) أكبر من إجمالي الفاتورة (% )', v_noncash, v_total;
+  end if;
+  if v_paid + 0.001 < v_total then
+    raise exception 'المبلغ المدفوع (% ) أقل من الإجمالي (% )', v_paid, v_total;
+  end if;
+  v_change := round(v_paid - v_total, 2);
+
+  -- البيع الآجل
+  if v_on_account > 0 then
+    if v_customer is null then
+      raise exception 'البيع الآجل يتطلب اختيار العميل';
+    end if;
+    if v_role = 'cashier' and not s.allow_cashier_credit then
+      raise exception 'البيع الآجل غير مسموح للكاشير';
+    end if;
+    if v_acc.account_balance + v_on_account > coalesce(v_acc.credit_limit, 0) + 0.001 then
+      raise exception 'يتجاوز حد الائتمان للعميل (الحد % ر.س، الرصيد الحالي % ر.س)',
+        coalesce(v_acc.credit_limit, 0), v_acc.account_balance;
+    end if;
+  end if;
+
+  v_invoice_no := 'INV-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.invoice_seq')::text, 6, '0');
+  insert into public.sales (
+    invoice_no, customer_id, cashier_id, subtotal, discount_total, invoice_discount,
+    vat_rate, vat_amount, total, paid_amount, change_amount, notes,
+    client_ref, promo_code, promo_discount, loyalty_points_redeemed, loyalty_discount, reservation_id
+  ) values (
+    v_invoice_no, v_customer, auth.uid(), (v_price ->> 'subtotal')::numeric, (v_price ->> 'discount_total')::numeric,
+    (v_price ->> 'invoice_discount')::numeric, s.vat_rate, (v_price ->> 'vat')::numeric, v_total, v_paid, v_change,
+    nullif(trim(p_notes), ''),
+    p_client_ref, case when (v_price ->> 'promo_code_applied')::boolean then v_price ->> 'promo_code' end,
+    (v_price ->> 'promo_discount')::numeric, v_points, (v_price ->> 'loyalty_discount')::numeric, p_reservation_id
+  ) returning id into v_sale_id;
+
+  insert into public.sale_items (
+    sale_id, variant_id, product_name, variant_label, sku, qty, unit_price,
+    line_discount, line_total, vat_amount, unit_cost, promo_discount, promotion_id
+  )
+  select v_sale_id, (l ->> 'variant_id')::uuid, l ->> 'product_name', l ->> 'variant_label',
+         l ->> 'sku', (l ->> 'qty')::integer, (l ->> 'unit_price')::numeric,
+         (l ->> 'line_discount')::numeric, (l ->> 'line_total')::numeric,
+         (l ->> 'vat')::numeric, (l ->> 'cost')::numeric,
+         (l ->> 'promo')::numeric, (l ->> 'promotion_id')::uuid
+    from jsonb_array_elements(v_price -> 'lines') l;
+
+  for v_line in select * from jsonb_array_elements(v_price -> 'lines') loop
+    perform public._move_stock(
+      (v_line ->> 'variant_id')::uuid, -((v_line ->> 'qty')::integer), 'sale', v_sale_id,
+      null, not s.allow_negative_stock);
+  end loop;
+
+  for v_pay in select * from jsonb_array_elements(p_payments) loop
+    v_method := (v_pay ->> 'method')::public.payment_method;
+    insert into public.sale_payments (sale_id, method, amount, reference, exchange_return_id)
+    values (
+      v_sale_id, v_method, round((v_pay ->> 'amount')::numeric, 2),
+      nullif(v_pay ->> 'reference', ''),
+      case when v_method = 'exchange_credit' then (v_pay ->> 'return_id')::uuid end
+    );
+    if v_method = 'exchange_credit' then
+      update public.returns set credit_used_by_sale = v_sale_id where id = (v_pay ->> 'return_id')::uuid;
+    end if;
+  end loop;
+
+  -- الذمم: قيد مدين بالمبلغ الآجل (قيد واحد لكل فاتورة — القيد الفريد يمنع التكرار)
+  if v_on_account > 0 then
+    perform public._post_ar(v_customer, 'sale', v_sale_id, v_invoice_no, v_on_account, 0, null);
+  end if;
+
+  -- الولاء: خصم المستبدل، ثم كسب نقاط على المدفوع فعلاً: بدون رصيد الاستبدال، وبدون الآجل
+  -- إلا ما غطّاه رصيد دائن سابق للعميل (عربون مدفوع مسبقاً = مدفوع فعلاً)
+  if v_customer is not null then
+    if v_points > 0 then
+      perform public._post_loyalty(v_customer, 'redeem', v_sale_id, v_invoice_no, -v_points, null);
+    end if;
+    if s.loyalty_enabled then
+      v_earn := floor(greatest(
+        v_total - v_exchange - (v_on_account - least(v_on_account, greatest(-v_acc.account_balance, 0))), 0)
+        * s.loyalty_points_per_sar)::integer;
+      if v_earn > 0 then
+        perform public._post_loyalty(v_customer, 'earn', v_sale_id, v_invoice_no, v_earn, null);
+        update public.sales set loyalty_points_earned = v_earn where id = v_sale_id;
+      end if;
+    end if;
+  end if;
+
+  if p_reservation_id is not null then
+    update public.reservations
+       set status = 'fulfilled', sale_id = v_sale_id, closed_at = now(), closed_by = auth.uid()
+     where id = p_reservation_id;
+  end if;
+
+  return v_sale_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- المرتجع: ربط الذمم والنقاط (بعد أن يحدد process_return إجمالي المرتجع)
+-- ---------------------------------------------------------------------
+create or replace function public.on_return_posted()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_sale public.sales;
+  v_on_account numeric;
+  v_paid_now numeric;
+  v_prev numeric;
+  v_earned integer;
+  v_redeemed integer;
+  v_done integer;
+  v_ratio numeric;
+  v_delta integer;
+begin
+  select * into v_sale from public.sales where id = new.sale_id;
+
+  if new.refund_method = 'account' then
+    if v_sale.customer_id is null then
+      raise exception 'الإرجاع إلى الحساب يتطلب فاتورة باسم عميل';
+    end if;
+    perform public._post_ar(v_sale.customer_id, 'return', new.id, new.return_no, 0, new.total, v_sale.invoice_no);
+  else
+    -- فاتورة فيها جزء آجل: لا يُرد نقداً/شبكة/استبدال أكثر مما دُفع فعلاً عند البيع
+    select coalesce(sum(amount) filter (where method = 'on_account'), 0),
+           coalesce(sum(amount) filter (where method <> 'on_account'), 0) - v_sale.change_amount
+      into v_on_account, v_paid_now
+      from public.sale_payments where sale_id = v_sale.id;
+    if v_on_account > 0 then
+      select coalesce(sum(total), 0) into v_prev from public.returns
+       where sale_id = v_sale.id and id <> new.id and refund_method <> 'account';
+      if v_prev + new.total > v_paid_now + 0.001 then
+        raise exception 'جزء من هذه الفاتورة آجل: الحد الأقصى للرد بهذه الطريقة % ر.س — اختر «إلى حساب العميل»',
+          greatest(v_paid_now - v_prev, 0);
+      end if;
+    end if;
+  end if;
+
+  -- النقاط: عكس المكتسب واسترجاع المستبدل بنسبة ما أُرجع من الفاتورة (تراكمياً لتفادي فروق التقريب)
+  if v_sale.customer_id is not null and v_sale.total > 0 then
+    v_ratio := least((select coalesce(sum(total), 0) from public.returns where sale_id = v_sale.id) / v_sale.total, 1);
+    select coalesce(sum(points), 0) into v_earned from public.loyalty_ledger
+     where entry_type = 'earn' and source_id = v_sale.id;
+    select -coalesce(sum(points), 0) into v_redeemed from public.loyalty_ledger
+     where entry_type = 'redeem' and source_id = v_sale.id;
+
+    if v_earned > 0 then
+      select -coalesce(sum(l.points), 0) into v_done from public.loyalty_ledger l
+        join public.returns r on r.id = l.source_id
+       where l.entry_type = 'return_reverse' and r.sale_id = v_sale.id;
+      v_delta := round(v_earned * v_ratio)::integer - v_done;
+      if v_delta > 0 then
+        perform public._post_loyalty(v_sale.customer_id, 'return_reverse', new.id, new.return_no, -v_delta, v_sale.invoice_no);
+      end if;
+    end if;
+    if v_redeemed > 0 then
+      select coalesce(sum(l.points), 0) into v_done from public.loyalty_ledger l
+        join public.returns r on r.id = l.source_id
+       where l.entry_type = 'return_restore' and r.sale_id = v_sale.id;
+      v_delta := round(v_redeemed * v_ratio)::integer - v_done;
+      if v_delta > 0 then
+        perform public._post_loyalty(v_sale.customer_id, 'return_restore', new.id, new.return_no, v_delta, v_sale.invoice_no);
+      end if;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger returns_posted after update of total on public.returns
+  for each row when (old.total = 0 and new.total > 0)
+  execute function public.on_return_posted();
+
+-- ---------------------------------------------------------------------
+-- الفاتورة للعميل برابط/QR (بدون تسجيل دخول) — بيانات الفاتورة فقط، دون بيانات العميل أو التكلفة
+-- ---------------------------------------------------------------------
+create or replace function public.public_receipt(p_token text)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v public.sales;
+  s public.store_settings;
+begin
+  if p_token is null or p_token !~ '^[0-9a-f]{32}$' then
+    return null;
+  end if;
+  select * into v from public.sales where public_token = p_token;
+  if v.id is null then
+    return null;
+  end if;
+  select * into s from public.store_settings where id = 1;
+  return jsonb_build_object(
+    'store', jsonb_build_object('name', s.store_name, 'name_en', s.store_name_en, 'vat_number', s.vat_number,
+                                'cr_number', s.cr_number, 'phone', s.phone, 'address', s.address,
+                                'footer', s.receipt_footer, 'prices_include_vat', s.prices_include_vat),
+    'invoice_no', v.invoice_no, 'created_at', v.created_at, 'status', v.status,
+    'subtotal', v.subtotal, 'discount_total', v.discount_total, 'vat_rate', v.vat_rate, 'vat_amount', v.vat_amount,
+    'total', v.total, 'paid_amount', v.paid_amount, 'change_amount', v.change_amount,
+    'returned_amount', v.returned_amount, 'loyalty_points_earned', v.loyalty_points_earned,
+    'items', coalesce((select jsonb_agg(jsonb_build_object(
+               'product_name', i.product_name, 'variant_label', i.variant_label, 'qty', i.qty,
+               'unit_price', i.unit_price, 'line_discount', i.line_discount, 'line_total', i.line_total,
+               'returned_qty', i.returned_qty) order by i.product_name)
+               from public.sale_items i where i.sale_id = v.id), '[]'::jsonb),
+    'payments', coalesce((select jsonb_agg(jsonb_build_object('method', p.method, 'amount', p.amount))
+               from public.sale_payments p where p.sale_id = v.id), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- استرجاع رقم الفاتورة من: رقم الفاتورة، أو الرمز، أو رابط QR (للمرتجع/الاستبدال)
+create or replace function public.resolve_invoice_ref(p_ref text)
+returns text
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_ref text := trim(coalesce(p_ref, ''));
+  v_token text;
+  v_no text;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  v_token := substring(v_ref from '([0-9a-f]{32})');
+  if v_token is not null then
+    select invoice_no into v_no from public.sales where public_token = v_token;
+  end if;
+  if v_no is null then
+    select invoice_no into v_no from public.sales where upper(invoice_no) = upper(v_ref);
+  end if;
+  if v_no is null then
+    raise exception 'الفاتورة غير موجودة';
+  end if;
+  return v_no;
+end;
+$$;
+
+-- سياق المرتجع: العميل والجزء الآجل ونقاط الفاتورة (لشاشة المرتجعات — بنفس صلاحية get_sale_for_return)
+create or replace function public.sale_return_context(p_sale_id uuid)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_role public.user_role := public.current_user_role();
+  s public.store_settings;
+  v public.sales;
+  v_on_account numeric;
+  v_paid_now numeric;
+  v_refunded numeric;
+begin
+  select * into s from public.store_settings where id = 1;
+  if v_role is null or (v_role = 'cashier' and not s.allow_cashier_returns) then
+    raise exception 'غير مصرح بعمليات الإرجاع';
+  end if;
+  select * into v from public.sales where id = p_sale_id;
+  if v.id is null then
+    raise exception 'الفاتورة غير موجودة';
+  end if;
+  select coalesce(sum(amount) filter (where method::text = 'on_account'), 0),
+         coalesce(sum(amount) filter (where method::text <> 'on_account'), 0) - v.change_amount
+    into v_on_account, v_paid_now
+    from public.sale_payments where sale_id = v.id;
+  select coalesce(sum(total), 0) into v_refunded from public.returns
+   where sale_id = v.id and refund_method::text <> 'account';
+  return jsonb_build_object(
+    'customer_id', v.customer_id,
+    'customer_phone', (select phone from public.customers where id = v.customer_id),
+    'on_account', v_on_account,
+    'max_direct_refund', case when v_on_account > 0 then greatest(v_paid_now - v_refunded, 0) end,
+    'loyalty_points_earned', v.loyalty_points_earned,
+    'loyalty_points_redeemed', v.loyalty_points_redeemed
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- سجل رسائل واتساب (فتح المحادثة من النظام)
+-- ---------------------------------------------------------------------
+create table public.message_log (
+  id uuid primary key default gen_random_uuid(),
+  channel text not null default 'whatsapp' check (channel in ('whatsapp')),
+  kind text not null check (kind in ('receipt', 'statement', 'reservation', 'reminder')),
+  sale_id uuid references public.sales (id) on delete set null,
+  customer_id uuid references public.customers (id) on delete set null,
+  reservation_id uuid references public.reservations (id) on delete set null,
+  phone text not null check (phone ~ '^[0-9]{8,15}$'),
+  created_by uuid not null references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now()
+);
+create index message_log_customer_idx on public.message_log (customer_id, created_at desc);
+create index message_log_sale_idx on public.message_log (sale_id);
+
+alter table public.message_log enable row level security;
+revoke all on public.message_log from anon;
+revoke update, delete on public.message_log from authenticated;
+grant select, insert on public.message_log to authenticated;
+create policy message_log_select on public.message_log for select to authenticated using (public.is_staff());
+create policy message_log_insert on public.message_log for insert to authenticated
+  with check (public.is_staff() and created_by = auth.uid());
+
+-- ---------------------------------------------------------------------
+-- الصلاحيات
+-- ---------------------------------------------------------------------
+revoke execute on function
+  public.complete_sale(jsonb, jsonb, uuid, numeric, text, uuid, text, integer, uuid),
+  public.price_cart(jsonb, numeric, text, integer, uuid),
+  public.resolve_invoice_ref(text),
+  public.sale_return_context(uuid),
+  public.public_receipt(text),
+  public.on_return_posted()
+from public, anon;
+grant execute on function
+  public.complete_sale(jsonb, jsonb, uuid, numeric, text, uuid, text, integer, uuid),
+  public.price_cart(jsonb, numeric, text, integer, uuid),
+  public.resolve_invoice_ref(text),
+  public.sale_return_context(uuid)
+to authenticated;
+-- الرابط العام للفاتورة: للزائر والمسجل
+grant execute on function public.public_receipt(text) to anon, authenticated;
+
+-- =====================================================================
+-- 0012_customer_insights.sql
+-- =====================================================================
+-- =====================================================================
+-- Sales & Customers 2.0 — (4) ملف العميل الشامل + تحليلات العملاء
+--   قراءة فقط. لا تكلفة ولا أرباح في ملف العميل (يراه الكاشير أيضاً).
+-- =====================================================================
+
+create or replace function public.customer_profile(p_customer_id uuid)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_c public.customers;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into v_c from public.customers where id = p_customer_id;
+  if v_c.id is null then
+    raise exception 'العميل غير موجود';
+  end if;
+
+  return (
+    with s as (select * from public.sales where customer_id = p_customer_id),
+    items as (
+      select i.*, v.size, v.color, c.name as category
+        from public.sale_items i
+        join s on s.id = i.sale_id
+        join public.product_variants v on v.id = i.variant_id
+        join public.products p on p.id = v.product_id
+        left join public.categories c on c.id = p.category_id
+    )
+    select jsonb_build_object(
+      'customer', to_jsonb(v_c),
+      'account', (select jsonb_build_object('account_balance', coalesce(a.account_balance, 0),
+                                            'credit_limit', a.credit_limit,
+                                            'loyalty_points', coalesce(a.loyalty_points, 0))
+                    from (select 1) x left join public.customer_accounts a on a.customer_id = p_customer_id),
+      'stats', (select jsonb_build_object(
+                  'invoices', count(*),
+                  'gross_spent', coalesce(sum(total), 0),
+                  'returned', coalesce(sum(returned_amount), 0),
+                  'net_spent', coalesce(sum(total - returned_amount), 0),
+                  'avg_basket', case when count(*) > 0 then round(sum(total - returned_amount) / count(*), 2) else 0 end,
+                  'first_purchase', min(created_at),
+                  'last_purchase', max(created_at),
+                  'days_since_last', (now() at time zone 'Asia/Riyadh')::date - (max(created_at) at time zone 'Asia/Riyadh')::date,
+                  'units', coalesce((select sum(qty - returned_qty) from items), 0),
+                  'promo_savings', coalesce(sum(promo_discount), 0),
+                  'points_redeemed', coalesce(sum(loyalty_points_redeemed), 0)
+                ) from s),
+      'favorite_sizes', coalesce((select jsonb_agg(x) from (
+          select size as label, sum(qty - returned_qty) as units from items where size is not null
+           group by size having sum(qty - returned_qty) > 0 order by 2 desc, 1 limit 3) x), '[]'::jsonb),
+      'favorite_colors', coalesce((select jsonb_agg(x) from (
+          select color as label, sum(qty - returned_qty) as units from items where color is not null
+           group by color having sum(qty - returned_qty) > 0 order by 2 desc, 1 limit 3) x), '[]'::jsonb),
+      'favorite_categories', coalesce((select jsonb_agg(x) from (
+          select category as label, sum(qty - returned_qty) as units from items where category is not null
+           group by category having sum(qty - returned_qty) > 0 order by 2 desc, 1 limit 3) x), '[]'::jsonb),
+      'purchases', coalesce((select jsonb_agg(x order by x.created_at desc) from (
+          select s.id, s.invoice_no, s.created_at, s.total, s.returned_amount, s.status, s.public_token,
+                 s.cashier_id = auth.uid() as is_mine,
+                 (select sum(qty) from public.sale_items where sale_id = s.id) as units,
+                 (select string_agg(distinct method::text, ',') from public.sale_payments where sale_id = s.id) as methods,
+                 (select string_agg(product_name || coalesce(' ' || variant_label, ''), '، ' order by product_name)
+                    from public.sale_items where sale_id = s.id) as summary
+            from s order by s.created_at desc limit 50) x), '[]'::jsonb),
+      'reservations', coalesce((select jsonb_agg(x order by x.created_at desc) from (
+          select r.id, r.reservation_no, r.status, r.expires_at, r.created_at, r.notes,
+                 r.status = 'active' and r.expires_at <= now() as expired,
+                 (select jsonb_agg(jsonb_build_object('variant_id', i.variant_id, 'qty', i.qty, 'sku', v.sku,
+                                                      'product_name', p.name,
+                                                      'variant_label', nullif(concat_ws(' / ', v.size, v.color), '')))
+                    from public.reservation_items i
+                    join public.product_variants v on v.id = i.variant_id
+                    join public.products p on p.id = v.product_id
+                   where i.reservation_id = r.id) as items
+            from public.reservations r where r.customer_id = p_customer_id
+           order by r.created_at desc limit 20) x), '[]'::jsonb),
+      'loyalty', coalesce((select jsonb_agg(x order by x.id desc) from (
+          select id, entry_type, ref_no, points, balance_after, note, created_at
+            from public.loyalty_ledger where customer_id = p_customer_id order by id desc limit 30) x), '[]'::jsonb),
+      'messages', (select count(*) from public.message_log where customer_id = p_customer_id)
+    )
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- تحليلات العملاء (للمدير)
+-- الشرائح بقواعد واضحة (R = أيام منذ آخر شراء، F = عدد الفواتير آخر 365 يوماً):
+--   مميز: R ≤ 30 و F ≥ 4 | وفيّ: R ≤ 60 و F ≥ 2 | جديد: أول شراء خلال 30 يوماً
+--   معرّض للفقد: 60 < R ≤ 120 و F ≥ 2 | مفقود: R > 120 | عرضي: غير ذلك
+-- ---------------------------------------------------------------------
+create or replace function public.customer_analytics(p_from date, p_to date)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_from timestamptz := p_from::timestamp at time zone 'Asia/Riyadh';
+  v_to timestamptz := (p_to + 1)::timestamp at time zone 'Asia/Riyadh';
+  s public.store_settings;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_from is null or p_to is null or p_to < p_from then
+    raise exception 'الفترة غير صحيحة';
+  end if;
+  select * into s from public.store_settings where id = 1;
+
+  return (
+    with ps as (select * from public.sales where created_at >= v_from and created_at < v_to),
+    per_customer as (
+      select customer_id, count(*) as invoices, sum(total - returned_amount) as net, max(created_at) as last_at
+        from ps where customer_id is not null group by customer_id
+    ),
+    life as (
+      select customer_id, min(created_at) as first_at, max(created_at) as last_at,
+             count(*) filter (where created_at >= now() - interval '365 days') as f365,
+             sum(total - returned_amount) filter (where created_at >= now() - interval '365 days') as m365
+        from public.sales where customer_id is not null group by customer_id
+    ),
+    seg as (
+      select l.*,
+             (now() at time zone 'Asia/Riyadh')::date - (l.last_at at time zone 'Asia/Riyadh')::date as r,
+             case
+               when now() - l.last_at <= interval '30 days' and l.f365 >= 4 then 'champions'
+               when now() - l.last_at <= interval '60 days' and l.f365 >= 2 then 'loyal'
+               when now() - l.first_at <= interval '30 days' then 'new'
+               when now() - l.last_at > interval '60 days' and now() - l.last_at <= interval '120 days' and l.f365 >= 2 then 'at_risk'
+               when now() - l.last_at > interval '120 days' then 'lost'
+               else 'occasional'
+             end as segment
+        from life l
+    )
+    select jsonb_build_object(
+      'from', p_from, 'to', p_to,
+      'customers_total', (select count(*) from public.customers),
+      'customers_new', (select count(*) from public.customers where created_at >= v_from and created_at < v_to),
+      'customers_active', (select count(*) from per_customer),
+      'customers_returning', (select count(*) from per_customer pc join life l on l.customer_id = pc.customer_id
+                               where l.first_at < v_from),
+      'repeat_rate', case when (select count(*) from per_customer) > 0
+                          then round(100.0 * (select count(*) from per_customer where invoices >= 2)
+                                     / (select count(*) from per_customer), 1) else 0 end,
+      'sales_registered', coalesce((select sum(total - returned_amount) from ps where customer_id is not null), 0),
+      'sales_walkin', coalesce((select sum(total - returned_amount) from ps where customer_id is null), 0),
+      'invoices_registered', (select count(*) from ps where customer_id is not null),
+      'invoices_walkin', (select count(*) from ps where customer_id is null),
+      'avg_basket_registered', coalesce((select round(avg(total - returned_amount), 2) from ps where customer_id is not null), 0),
+      'avg_basket_walkin', coalesce((select round(avg(total - returned_amount), 2) from ps where customer_id is null), 0),
+      'avg_spend_per_customer', coalesce((select round(avg(net), 2) from per_customer), 0),
+      'top_customers', coalesce((select jsonb_agg(x order by x.net desc) from (
+          select c.id, c.name, c.phone, pc.invoices, pc.net, pc.last_at,
+                 coalesce(a.loyalty_points, 0) as loyalty_points, coalesce(a.account_balance, 0) as account_balance
+            from per_customer pc join public.customers c on c.id = pc.customer_id
+            left join public.customer_accounts a on a.customer_id = c.id
+           order by pc.net desc limit 10) x), '[]'::jsonb),
+      'segments', coalesce((select jsonb_object_agg(segment, jsonb_build_object('count', cnt, 'value', val)) from (
+          select segment, count(*) as cnt, coalesce(sum(m365), 0) as val from seg group by segment) x), '{}'::jsonb),
+      'at_risk_customers', coalesce((select jsonb_agg(x order by x.value desc) from (
+          select c.id, c.name, c.phone, sg.r as days_since, sg.f365 as invoices, coalesce(sg.m365, 0) as value
+            from seg sg join public.customers c on c.id = sg.customer_id
+           where sg.segment = 'at_risk' order by sg.m365 desc nulls last limit 10) x), '[]'::jsonb),
+      'loyalty', jsonb_build_object(
+        'enabled', s.loyalty_enabled,
+        'points_outstanding', coalesce((select sum(loyalty_points) from public.customer_accounts where loyalty_points > 0), 0),
+        'liability', round(coalesce((select sum(loyalty_points) from public.customer_accounts where loyalty_points > 0), 0)
+                           * s.loyalty_point_value, 2),
+        'earned', coalesce((select sum(points) from public.loyalty_ledger
+                             where entry_type = 'earn' and created_at >= v_from and created_at < v_to), 0),
+        'redeemed', coalesce((select -sum(points) from public.loyalty_ledger
+                               where entry_type = 'redeem' and created_at >= v_from and created_at < v_to), 0),
+        'redeemed_value', coalesce((select sum(loyalty_discount) from ps), 0)),
+      'credit', jsonb_build_object(
+        'receivable', coalesce((select sum(account_balance) from public.customer_accounts where account_balance > 0), 0),
+        'credit_balances', coalesce((select -sum(account_balance) from public.customer_accounts where account_balance < 0), 0),
+        'credit_sales', coalesce((select sum(p.amount) from public.sale_payments p join ps on ps.id = p.sale_id
+                                   where p.method::text = 'on_account'), 0),
+        'collections', coalesce((select sum(amount) from public.customer_payments
+                                  where kind = 'receipt' and voided_at is null
+                                    and created_at >= v_from and created_at < v_to), 0)),
+      'promotions', coalesce((select jsonb_agg(x order by x.discount desc) from (
+          select pr.id, pr.name, pr.code, count(distinct i.sale_id) as invoices, sum(i.qty) as units,
+                 sum(i.promo_discount) as discount, sum(i.line_total) as revenue
+            from public.sale_items i join ps on ps.id = i.sale_id
+            join public.promotions pr on pr.id = i.promotion_id
+           group by pr.id, pr.name, pr.code) x), '[]'::jsonb),
+      'reservations', jsonb_build_object(
+        'active', (select count(*) from public.reservations where status = 'active' and expires_at > now()),
+        'expired', (select count(*) from public.reservations where status = 'active' and expires_at <= now()),
+        'fulfilled', (select count(*) from public.reservations where status = 'fulfilled'
+                        and closed_at >= v_from and closed_at < v_to),
+        'cancelled', (select count(*) from public.reservations where status = 'cancelled'
+                        and closed_at >= v_from and closed_at < v_to)),
+      'whatsapp_sent', (select count(*) from public.message_log where created_at >= v_from and created_at < v_to)
+    )
+  );
+end;
+$$;
+
+revoke execute on function public.customer_profile(uuid), public.customer_analytics(date, date) from public, anon;
+grant execute on function public.customer_profile(uuid), public.customer_analytics(date, date) to authenticated;
 
 commit;

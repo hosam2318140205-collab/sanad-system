@@ -13,6 +13,11 @@ export interface ReceiptData {
   cashierName?: string | null;
   customerName?: string | null;
   customerVat?: string | null;
+  customerPhone?: string | null;
+  customerId?: string | null;
+  /** رصيد العميل بعد الفاتورة (النقاط والذمة) */
+  customerPoints?: number | null;
+  customerBalance?: number | null;
 }
 
 const fmt = (n: number) => Number(n).toFixed(2);
@@ -31,6 +36,20 @@ export function Receipt({
 }) {
   const { sale, items, payments } = data;
   const [qr, setQr] = useState<string | null>(null);
+  const [lookupQr, setLookupQr] = useState<string | null>(null);
+  const token = sale.public_token;
+
+  // QR ثانٍ: رابط الفاتورة — العميل يعرضها من جواله، والكاشير يمسحه لاسترجاع الفاتورة في المرتجع/الاستبدال
+  useEffect(() => {
+    let cancelled = false;
+    if (!token) return;
+    QRCode.toDataURL(`${window.location.origin}/r/${token}`, { margin: 0, width: 200, errorCorrectionLevel: "M" })
+      .then((url) => !cancelled && setLookupQr(url))
+      .catch(() => !cancelled && setLookupQr(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
 
   useEffect(() => {
     let cancelled = false;
@@ -136,6 +155,18 @@ export function Receipt({
               <td style={{ textAlign: "left" }}>{fmt(sale.discount_total)}</td>
             </tr>
           )}
+          {Number(sale.promo_discount ?? 0) > 0 && (
+            <tr style={{ fontSize: "0.9em" }}>
+              <td>منها عروض{sale.promo_code ? ` (${sale.promo_code})` : ""}</td>
+              <td style={{ textAlign: "left" }}>{fmt(sale.promo_discount ?? 0)}</td>
+            </tr>
+          )}
+          {Number(sale.loyalty_points_redeemed ?? 0) > 0 && (
+            <tr style={{ fontSize: "0.9em" }}>
+              <td>منها استبدال {sale.loyalty_points_redeemed} نقطة</td>
+              <td style={{ textAlign: "left" }}>{fmt(sale.loyalty_discount ?? 0)}</td>
+            </tr>
+          )}
           <tr>
             <td>الإجمالي غير شامل الضريبة</td>
             <td style={{ textAlign: "left" }}>{fmt(sale.subtotal)}</td>
@@ -166,13 +197,52 @@ export function Receipt({
               <td style={{ textAlign: "left" }}>{fmt(sale.change_amount)}</td>
             </tr>
           )}
+          {data.customerBalance != null && payments.some((p) => p.method === "on_account") && (
+            <tr>
+              <td>رصيد حساب العميل</td>
+              <td style={{ textAlign: "left" }}>{fmt(data.customerBalance)}</td>
+            </tr>
+          )}
         </tbody>
       </table>
-
-      {qr && (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={qr} alt="ZATCA QR" style={{ width: "34mm", height: "34mm", margin: "8px auto 4px", display: "block" }} />
+      {(Number(sale.loyalty_points_earned ?? 0) > 0 || data.customerPoints != null) && data.customerName && (
+        <>
+          <div className="dashed" />
+          <table>
+            <tbody>
+              {Number(sale.loyalty_points_earned ?? 0) > 0 && (
+                <tr>
+                  <td>نقاط مكتسبة</td>
+                  <td style={{ textAlign: "left" }}>{sale.loyalty_points_earned}</td>
+                </tr>
+              )}
+              {data.customerPoints != null && (
+                <tr>
+                  <td>رصيد النقاط</td>
+                  <td style={{ textAlign: "left" }}>{data.customerPoints}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </>
       )}
+
+      <div style={{ display: "flex", justifyContent: "center", alignItems: "flex-start", gap: "4mm", marginTop: 8 }}>
+        {qr && (
+          <div style={{ textAlign: "center" }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={qr} alt="ZATCA QR" style={{ width: "30mm", height: "30mm", display: "block" }} />
+            <div style={{ fontSize: "0.75em" }}>هيئة الزكاة</div>
+          </div>
+        )}
+        {lookupQr && (
+          <div style={{ textAlign: "center" }}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={lookupQr} alt="رمز الفاتورة" data-testid="lookup-qr" style={{ width: "22mm", height: "22mm", display: "block" }} />
+            <div style={{ fontSize: "0.75em" }}>الفاتورة / الإرجاع</div>
+          </div>
+        )}
+      </div>
       {settings.receipt_footer && (
         <div style={{ textAlign: "center", marginTop: 4, whiteSpace: "pre-line" }}>{settings.receipt_footer}</div>
       )}

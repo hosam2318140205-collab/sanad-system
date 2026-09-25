@@ -67,15 +67,19 @@ export function CameraScanner({
   onDetected,
   continuous = false,
   title = "مسح الباركود بالكاميرا",
+  withQr = false,
 }: {
   open: boolean;
   onClose: () => void;
   onDetected: (code: string) => ScanOutcome | void;
   continuous?: boolean;
   title?: string;
+  /** قراءة رموز QR أيضاً (مثل رمز الفاتورة في المرتجع) */
+  withQr?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const handlerRef = useRef(onDetected);
+  const withQrRef = useRef(withQr);
   const closeRef = useRef(onClose);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(true);
@@ -107,6 +111,7 @@ export function CameraScanner({
           BarcodeFormat.UPC_E,
           BarcodeFormat.CODE_128,
           BarcodeFormat.CODE_39,
+          ...(withQrRef.current ? [BarcodeFormat.QR_CODE] : []),
         ]);
         const reader = new BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 120 });
         if (stopped || !videoRef.current) return;
