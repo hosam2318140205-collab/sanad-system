@@ -1,6 +1,6 @@
 -- ملف مُولَّد تلقائياً من supabase/migrations — لا تعدّله يدوياً (npm run db:bundle)
 -- نفّذه مرة واحدة فقط على مشروع Supabase جديد، في SQL Editor.
--- يحتوي: 0001_schema.sql, 0002_triggers_audit.sql, 0003_rls.sql, 0004_functions.sql, 0005_storage_limits.sql, 0006_shifts.sql, 0007_expenses.sql, 0008_purchase_advisor.sql
+-- يحتوي: 0001_schema.sql, 0002_triggers_audit.sql, 0003_rls.sql, 0004_functions.sql, 0005_storage_limits.sql, 0006_shifts.sql, 0007_expenses.sql, 0008_purchase_advisor.sql, 0013_locations_transfers.sql, 0014_smart_counts.sql, 0015_inventory_intelligence.sql, 0016_decision_center.sql
 
 begin;
 
@@ -2416,5 +2416,1938 @@ revoke execute on function public.purchase_advisor(integer, integer, integer) fr
 revoke execute on function public.create_purchase_draft(uuid, jsonb, text) from public, anon;
 grant execute on function public.purchase_advisor(integer, integer, integer) to authenticated;
 grant execute on function public.create_purchase_draft(uuid, jsonb, text) to authenticated;
+
+-- =====================================================================
+-- 0013_locations_transfers.sql
+-- =====================================================================
+-- =====================================================================
+-- Smart Inventory 2.0 — (1) المواقع ومخزون كل موقع + التحويلات
+--   • location_stock / location_movements هما المصدر التفصيلي للحقيقة لكل موقع (فرع/مستودع/في الطريق)
+--   • product_variants.stock_qty يبقى الإجمالي، والقيد الإلزامي:
+--       مجموع location_stock لكل صنف = product_variants.stock_qty   (يُفحص عند نهاية كل معاملة)
+--   • كل حركة في stock_movements (بيع، مرتجع، شراء، جرد، تسوية، افتتاحي) تُنسب لموقعها تلقائياً
+--     عبر trigger — دون تعديل complete_sale أو process_return أو receive_purchase
+--   • «في الطريق» موقع فعلي: الشحن ينقل من المصدر إليه، والاستلام ينقل منه للوجهة
+--   • التحويل ليس بيعاً ولا شراءً: لا يلمس الفواتير ولا التكلفة ولا الضريبة، ولا يغير الإجمالي
+--   • متجر بموقع واحد: كل شيء يعمل كما كان تماماً
+-- =====================================================================
+
+create type public.location_kind as enum ('store', 'warehouse', 'transit');
+create type public.loc_movement_type as enum (
+  'opening', 'sale', 'return', 'purchase', 'adjustment', 'count',
+  'transfer_out', 'transit_in', 'transit_out', 'transfer_in', 'transit_loss');
+create type public.transfer_status as enum (
+  'requested', 'approved', 'in_transit', 'short_received', 'completed', 'rejected', 'cancelled');
+
+alter table public.store_settings
+  add column inventory_segregation boolean not null default false;   -- فصل المهام في التحويلات والفروقات
+
+create table public.locations (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique check (code ~ '^[A-Z0-9_-]{2,20}$'),
+  name text not null check (length(trim(name)) > 0),
+  kind public.location_kind not null default 'store',
+  is_default boolean not null default false,
+  is_active boolean not null default true,
+  address text,
+  phone text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint default_is_store check (not is_default or (kind = 'store' and is_active)),
+  constraint transit_is_system check (kind <> 'transit' or not is_default)
+);
+create unique index locations_one_default on public.locations (is_default) where is_default;
+create unique index locations_one_transit on public.locations (kind) where kind = 'transit';
+create trigger locations_touch before update on public.locations
+  for each row execute function public.touch_updated_at();
+
+insert into public.locations (code, name, kind, is_default)
+values ('MAIN', coalesce((select store_name from public.store_settings where id = 1), 'المحل الرئيسي'), 'store', true),
+       ('TRANSIT', 'بضاعة في الطريق', 'transit', false);
+
+-- موقع عمل كل موظف (يحدده المالك). بدون تعيين = الموقع الرئيسي
+create table public.staff_locations (
+  profile_id uuid primary key references public.profiles (id) on delete cascade,
+  location_id uuid not null references public.locations (id),
+  updated_at timestamptz not null default now()
+);
+
+create table public.location_stock (
+  location_id uuid not null references public.locations (id),
+  variant_id uuid not null references public.product_variants (id) on delete cascade,
+  qty integer not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (location_id, variant_id)
+);
+create index location_stock_variant_idx on public.location_stock (variant_id);
+
+create table public.location_movements (
+  id bigint generated always as identity primary key,
+  location_id uuid not null references public.locations (id),
+  variant_id uuid not null references public.product_variants (id) on delete cascade,
+  type public.loc_movement_type not null,
+  qty_change integer not null check (qty_change <> 0),
+  balance_after integer not null,
+  stock_movement_id bigint references public.stock_movements (id) on delete cascade,
+  transfer_id uuid,
+  ref_id uuid,
+  note text,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  -- وقت فعلي (وليس بداية المعاملة) حتى تُرتَّب الحركات بدقة مقابل لقطة الجرد
+  created_at timestamptz not null default clock_timestamp()
+);
+create index location_movements_loc_idx on public.location_movements (location_id, variant_id, created_at);
+create index location_movements_variant_idx on public.location_movements (variant_id, created_at);
+create index location_movements_transfer_idx on public.location_movements (transfer_id);
+
+alter table public.shifts add column location_id uuid references public.locations (id);
+alter table public.purchase_orders add column location_id uuid references public.locations (id);
+alter table public.stock_counts add column location_id uuid references public.locations (id);
+
+-- ---------------------------------------------------------------------
+-- مساعدات
+-- ---------------------------------------------------------------------
+create or replace function public._default_location()
+returns uuid language sql stable security definer set search_path = public as $$
+  select id from public.locations where is_default
+$$;
+
+create or replace function public._transit_location()
+returns uuid language sql stable security definer set search_path = public as $$
+  select id from public.locations where kind = 'transit'
+$$;
+
+-- موقع الموظف الحالي: ورديته المفتوحة، ثم تعيينه، ثم الرئيسي
+create or replace function public._my_location()
+returns uuid language sql stable security definer set search_path = public as $$
+  select coalesce(
+    (select location_id from public.shifts where cashier_id = auth.uid() and status = 'open'),
+    (select location_id from public.staff_locations where profile_id = auth.uid()),
+    public._default_location())
+$$;
+
+create or replace function public._multi_location()
+returns boolean language sql stable security definer set search_path = public as $$
+  select count(*) > 1 from public.locations where is_active and kind <> 'transit'
+$$;
+
+-- الموقع + الكمية الأكبر خارج موقع معين (لرسالة «متوفر في فرع آخر»)
+create or replace function public._best_other_location(p_variant uuid, p_exclude uuid)
+returns table (location_name text, qty integer)
+language sql stable security definer set search_path = public as $$
+  select l.name, s.qty
+    from public.location_stock s join public.locations l on l.id = s.location_id
+   where s.variant_id = p_variant and s.location_id <> p_exclude and l.kind <> 'transit' and l.is_active and s.qty > 0
+   order by s.qty desc, l.name
+   limit 1
+$$;
+
+-- تحريك مخزون موقع (داخلي): يحدّث الرصيد ويسجّل الحركة. الإجمالي لا يتغير هنا —
+-- الحركات التي تغيّر الإجمالي تمر عبر _move_stock ثم trigger النسب أدناه.
+create or replace function public._apply_location(
+  p_location uuid, p_variant uuid, p_delta integer, p_type public.loc_movement_type,
+  p_stock_movement bigint, p_transfer uuid, p_ref uuid, p_note text, p_check_negative boolean
+) returns integer
+language plpgsql security definer set search_path = public as $$
+declare
+  v_balance integer;
+begin
+  if p_delta = 0 then
+    return null;
+  end if;
+  insert into public.location_stock (location_id, variant_id, qty, updated_at)
+  values (p_location, p_variant, p_delta, now())
+  on conflict (location_id, variant_id) do update
+    set qty = public.location_stock.qty + excluded.qty, updated_at = now()
+  returning qty into v_balance;
+
+  if p_check_negative and v_balance < 0 then
+    raise exception 'الكمية غير متوفرة في % (المتوفر % فقط)',
+      (select name from public.locations where id = p_location), v_balance - p_delta;
+  end if;
+
+  insert into public.location_movements
+    (location_id, variant_id, type, qty_change, balance_after, stock_movement_id, transfer_id, ref_id, note)
+  values (p_location, p_variant, p_type, p_delta, v_balance, p_stock_movement, p_transfer, p_ref, p_note);
+  return v_balance;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- نسب كل حركة مخزون إجمالية إلى موقعها
+--   بيع/مرتجع ← موقع وردية الكاشير | شراء ← موقع أمر الشراء | جرد ← موقع الجرد
+--   غير ذلك (افتتاحي، تسوية) ← الموقع المحدد في الجلسة app.location_id أو الرئيسي
+-- البيع من فرع لا يملك كمية محلية كافية مرفوض إن كان المخزون السالب غير مسموح
+-- ---------------------------------------------------------------------
+create or replace function public.attribute_stock_movement()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_loc uuid := nullif(current_setting('app.location_id', true), '')::uuid;
+  v_type public.loc_movement_type :=
+    coalesce(nullif(current_setting('app.location_type', true), '')::public.loc_movement_type, new.type::text::public.loc_movement_type);
+  v_balance integer;
+  v_other record;
+  v_allow_negative boolean;
+begin
+  if coalesce(current_setting('app.skip_location', true), '') = 'on' then
+    return new;
+  end if;
+
+  if v_loc is null then
+    if new.type = 'sale' then
+      select sh.location_id into v_loc
+        from public.sales s left join public.shifts sh on sh.id = s.shift_id where s.id = new.ref_id;
+    elsif new.type = 'return' then
+      select coalesce(rsh.location_id, ssh.location_id) into v_loc
+        from public.returns r
+        left join public.shifts rsh on rsh.id = r.shift_id
+        left join public.sales s on s.id = r.sale_id
+        left join public.shifts ssh on ssh.id = s.shift_id
+       where r.id = new.ref_id;
+    elsif new.type = 'purchase' then
+      select location_id into v_loc from public.purchase_orders where id = new.ref_id;
+    elsif new.type = 'count' then
+      select location_id into v_loc from public.stock_counts where id = new.ref_id;
+    end if;
+  end if;
+  v_loc := coalesce(v_loc, public._default_location());
+
+  v_balance := public._apply_location(v_loc, new.variant_id, new.qty_change, v_type, new.id, null, new.ref_id, new.note, false);
+
+  if new.type = 'sale' and v_balance < 0 then
+    select allow_negative_stock into v_allow_negative from public.store_settings where id = 1;
+    if not v_allow_negative then
+      select * into v_other from public._best_other_location(new.variant_id, v_loc);
+      raise exception 'غير متوفر في هذا الفرع (%): الصنف % المتوفر % فقط%',
+        (select name from public.locations where id = v_loc),
+        (select sku from public.product_variants where id = new.variant_id),
+        greatest(v_balance - new.qty_change, 0),
+        case when v_other.qty is not null
+          then format(' — متوفر %s قطع في %s، يمكنك طلب تحويل', v_other.qty, v_other.location_name) else '' end;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger stock_movements_attribute after insert on public.stock_movements
+  for each row execute function public.attribute_stock_movement();
+
+-- ---------------------------------------------------------------------
+-- القيد الإلزامي: مجموع مواقع الصنف = إجمالي الصنف (يُفحص عند نهاية المعاملة)
+-- أي مسار يعدّل أحدهما دون الآخر يفشل ولا يُحفظ شيء
+-- ---------------------------------------------------------------------
+create or replace function public._check_location_invariant(p_variant uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_total integer;
+  v_sum integer;
+begin
+  select stock_qty into v_total from public.product_variants where id = p_variant;
+  if not found then
+    return;  -- صنف محذوف (مواقعه تُحذف معه)
+  end if;
+  select coalesce(sum(qty), 0) into v_sum from public.location_stock where variant_id = p_variant;
+  if v_sum <> v_total then
+    raise exception 'تعارض مخزون: الصنف % إجماليه % ومجموع مواقعه %',
+      (select sku from public.product_variants where id = p_variant), v_total, v_sum
+      using errcode = 'P0001';
+  end if;
+end;
+$$;
+
+create or replace function public.location_stock_invariant()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  perform public._check_location_invariant(coalesce(new.variant_id, old.variant_id));
+  return null;
+end;
+$$;
+
+create or replace function public.variant_stock_invariant()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  perform public._check_location_invariant(new.id);
+  return null;
+end;
+$$;
+
+create constraint trigger location_stock_invariant
+  after insert or update or delete on public.location_stock
+  deferrable initially deferred
+  for each row execute function public.location_stock_invariant();
+
+create constraint trigger variant_stock_invariant
+  after insert or update of stock_qty on public.product_variants
+  deferrable initially deferred
+  for each row execute function public.variant_stock_invariant();
+
+-- الأرصدة الحالية كلها في الموقع الرئيسي (إضافة فقط — لا تغيير على أي صف قائم)
+insert into public.location_stock (location_id, variant_id, qty)
+select public._default_location(), id, stock_qty from public.product_variants where stock_qty <> 0;
+insert into public.location_movements (location_id, variant_id, type, qty_change, balance_after, note)
+select public._default_location(), id, 'opening', stock_qty, stock_qty, 'رصيد عند تفعيل المواقع'
+  from public.product_variants where stock_qty <> 0;
+
+-- ---------------------------------------------------------------------
+-- موقع الوردية وأمر الشراء (عند الإنشاء)
+-- ---------------------------------------------------------------------
+create or replace function public.shift_set_location()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.location_id is null then
+    new.location_id := coalesce(
+      (select location_id from public.staff_locations where profile_id = new.cashier_id),
+      public._default_location());
+  end if;
+  if (select kind from public.locations where id = new.location_id) = 'transit' then
+    raise exception 'موقع غير صالح';
+  end if;
+  return new;
+end;
+$$;
+create trigger shifts_set_location before insert on public.shifts
+  for each row execute function public.shift_set_location();
+
+create or replace function public.purchase_set_location()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.location_id is null then
+    new.location_id := public._default_location();
+  end if;
+  if (select kind from public.locations where id = new.location_id) = 'transit'
+     or not (select is_active from public.locations where id = new.location_id) then
+    raise exception 'موقع الاستلام غير صالح';
+  end if;
+  -- بعد الاستلام لا يُغيَّر موقع أمر الشراء (الحركات نُسبت إليه)
+  if tg_op = 'UPDATE' and old.status = 'received' and new.location_id is distinct from old.location_id then
+    raise exception 'لا يمكن تغيير موقع أمر شراء مستلم';
+  end if;
+  return new;
+end;
+$$;
+create trigger purchase_orders_set_location before insert or update of location_id on public.purchase_orders
+  for each row execute function public.purchase_set_location();
+
+-- ---------------------------------------------------------------------
+-- منع التكرار لعمليات المخزون (مفتاح لكل عملية من الواجهة)
+-- ---------------------------------------------------------------------
+create table public.inventory_ops (
+  client_ref uuid primary key,
+  op text not null,
+  ref_id uuid,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now()
+);
+
+-- يعيد true إن كانت العملية نُفذت سابقاً (فيتوقف المستدعي دون أي أثر)
+create or replace function public._op_seen(p_client_ref uuid, p_op text, p_ref uuid)
+returns boolean language plpgsql security definer set search_path = public as $$
+declare
+  v public.inventory_ops;
+begin
+  if p_client_ref is null then
+    return false;
+  end if;
+  select * into v from public.inventory_ops where client_ref = p_client_ref;
+  if v.client_ref is not null then
+    if v.op <> p_op or v.created_by is distinct from auth.uid() then
+      raise exception 'مرجع العملية مستخدم مسبقاً';
+    end if;
+    return true;
+  end if;
+  insert into public.inventory_ops (client_ref, op, ref_id) values (p_client_ref, p_op, p_ref);
+  return false;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- تسوية مخزون موقع محدد (للمدير) — لا يُسمح بالنزول تحت الصفر
+-- ---------------------------------------------------------------------
+create or replace function public.adjust_location_stock(
+  p_location uuid, p_variant uuid, p_qty_change integer, p_note text, p_client_ref uuid default null
+) returns integer
+language plpgsql security definer set search_path = public as $$
+declare
+  v_balance integer;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(p_qty_change, 0) = 0 or coalesce(trim(p_note), '') = '' then
+    raise exception 'أدخل الكمية والسبب';
+  end if;
+  if (select kind from public.locations where id = p_location and is_active) is distinct from 'store'
+     and (select kind from public.locations where id = p_location and is_active) is distinct from 'warehouse' then
+    raise exception 'موقع غير صالح';
+  end if;
+  if public._op_seen(p_client_ref, 'adjust', p_variant) then
+    return (select qty from public.location_stock where location_id = p_location and variant_id = p_variant);
+  end if;
+  perform 1 from public.location_stock where location_id = p_location and variant_id = p_variant for update;
+  if coalesce((select qty from public.location_stock where location_id = p_location and variant_id = p_variant), 0)
+     + p_qty_change < 0 then
+    raise exception 'التسوية تجعل مخزون الموقع سالباً';
+  end if;
+  perform set_config('app.location_id', p_location::text, true);
+  perform public._move_stock(p_variant, p_qty_change, 'adjustment', null, trim(p_note), false);
+  perform set_config('app.location_id', '', true);
+  return (select qty from public.location_stock where location_id = p_location and variant_id = p_variant);
+end;
+$$;
+
+-- =====================================================================
+-- التحويلات: طلب ← اعتماد ← شحن (جزئي/كلي) ← استلام (جزئي/كلي) ← فروقات معلقة ← اعتماد الفقد
+-- =====================================================================
+create sequence public.transfer_seq start 1;
+
+create table public.transfers (
+  id uuid primary key default gen_random_uuid(),
+  transfer_no text not null unique
+    default ('TRF-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.transfer_seq')::text, 5, '0')),
+  from_location uuid not null references public.locations (id),
+  to_location uuid not null references public.locations (id),
+  status public.transfer_status not null default 'requested',
+  notes text,
+  client_ref uuid unique,
+  requested_by uuid references public.profiles (id) default auth.uid(),
+  requested_at timestamptz not null default now(),
+  approved_by uuid references public.profiles (id),
+  approved_at timestamptz,
+  closed_by uuid references public.profiles (id),
+  closed_at timestamptz,
+  close_reason text,
+  completed_at timestamptz,
+  updated_at timestamptz not null default now(),
+  constraint transfer_distinct check (from_location <> to_location)
+);
+create index transfers_status_idx on public.transfers (status, requested_at desc);
+create trigger transfers_touch before update on public.transfers
+  for each row execute function public.touch_updated_at();
+
+create table public.transfer_items (
+  id uuid primary key default gen_random_uuid(),
+  transfer_id uuid not null references public.transfers (id) on delete cascade,
+  variant_id uuid not null references public.product_variants (id),
+  qty_requested integer not null check (qty_requested > 0),
+  qty_approved integer not null default 0 check (qty_approved >= 0),
+  qty_shipped integer not null default 0 check (qty_shipped >= 0),
+  qty_received integer not null default 0 check (qty_received >= 0),
+  qty_lost integer not null default 0 check (qty_lost >= 0),
+  discrepancy_by uuid references public.profiles (id),   -- من أنهى الاستلام بنقص (لفصل المهام)
+  discrepancy_at timestamptz,
+  unique (transfer_id, variant_id),
+  constraint shipped_le_approved check (qty_shipped <= qty_approved or qty_approved = 0 and qty_shipped = 0),
+  constraint settled_le_shipped check (qty_received + qty_lost <= qty_shipped)
+);
+
+-- التسلسل الزمني الكامل: من طلب/اعتمد/شحن/استلم/اعتمد الفقد، ومتى، وبأي كمية
+create table public.transfer_events (
+  id bigint generated always as identity primary key,
+  transfer_id uuid not null references public.transfers (id) on delete cascade,
+  event text not null check (event in ('request', 'approve', 'reject', 'cancel', 'ship', 'close_remaining',
+                                       'receive', 'finalize', 'loss')),
+  variant_id uuid references public.product_variants (id),
+  qty integer,
+  note text,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now()
+);
+create index transfer_events_transfer_idx on public.transfer_events (transfer_id, id);
+
+-- الكمية المعتمدة التي لم تُشحن بعد من موقع (محجوزة للتحويل الصادر)
+create or replace function public._outgoing_pending(p_location uuid, p_variant uuid, p_exclude uuid default null)
+returns integer language sql stable security definer set search_path = public as $$
+  select coalesce(sum(i.qty_approved - i.qty_shipped), 0)::integer
+    from public.transfer_items i join public.transfers t on t.id = i.transfer_id
+   where t.from_location = p_location and i.variant_id = p_variant
+     and t.status in ('approved', 'in_transit') and (p_exclude is null or t.id <> p_exclude)
+$$;
+
+create or replace function public._can_act_at(p_location uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_manager() or (public.is_staff() and public._my_location() = p_location)
+$$;
+
+-- تحديث حالة التحويل من كمياته
+create or replace function public._transfer_refresh(p_id uuid, p_finalize boolean)
+returns public.transfer_status
+language plpgsql security definer set search_path = public as $$
+declare
+  v_pending_ship integer;
+  v_pending_recv integer;
+  v_status public.transfer_status;
+begin
+  select coalesce(sum(qty_approved - qty_shipped), 0), coalesce(sum(qty_shipped - qty_received - qty_lost), 0)
+    into v_pending_ship, v_pending_recv
+    from public.transfer_items where transfer_id = p_id;
+
+  if v_pending_ship = 0 and v_pending_recv = 0 then
+    v_status := 'completed';
+  elsif v_pending_ship = 0 and (p_finalize or (select status from public.transfers where id = p_id) = 'short_received') then
+    v_status := 'short_received';
+    update public.transfer_items
+       set discrepancy_by = coalesce(discrepancy_by, auth.uid()), discrepancy_at = coalesce(discrepancy_at, now())
+     where transfer_id = p_id and qty_shipped - qty_received - qty_lost > 0;
+  else
+    v_status := 'in_transit';
+  end if;
+
+  update public.transfers
+     set status = v_status,
+         completed_at = case when v_status = 'completed' then now() end
+   where id = p_id;
+  return v_status;
+end;
+$$;
+
+-- p_items: [{"variant_id": uuid, "qty": int}]
+create or replace function public.request_transfer(
+  p_from uuid, p_to uuid, p_items jsonb, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_existing public.transfers;
+  v_id uuid;
+  v_line record;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_client_ref is not null then
+    select * into v_existing from public.transfers where client_ref = p_client_ref;
+    if v_existing.id is not null then
+      if v_existing.requested_by is distinct from auth.uid() then
+        raise exception 'مرجع العملية مستخدم مسبقاً';
+      end if;
+      return v_existing.id;
+    end if;
+  end if;
+  if p_from = p_to then
+    raise exception 'اختر موقعين مختلفين';
+  end if;
+  if exists (select 1 from public.locations where id in (p_from, p_to) and (kind = 'transit' or not is_active))
+     or (select count(*) from public.locations where id in (p_from, p_to)) <> 2 then
+    raise exception 'موقع غير صالح';
+  end if;
+  if not public.is_manager() and public._my_location() not in (p_from, p_to) then
+    raise exception 'الكاشير يطلب التحويل من/إلى فرعه فقط';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'لم يتم اختيار أصناف';
+  end if;
+
+  insert into public.transfers (from_location, to_location, notes, client_ref)
+  values (p_from, p_to, nullif(trim(p_notes), ''), p_client_ref)
+  returning id into v_id;
+
+  for v_line in
+    select (e ->> 'variant_id')::uuid as variant_id, sum((e ->> 'qty')::integer)::integer as qty
+      from jsonb_array_elements(p_items) e group by 1
+  loop
+    if v_line.qty is null or v_line.qty <= 0 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+    if not exists (select 1 from public.product_variants where id = v_line.variant_id) then
+      raise exception 'صنف غير موجود';
+    end if;
+    insert into public.transfer_items (transfer_id, variant_id, qty_requested) values (v_id, v_line.variant_id, v_line.qty);
+    insert into public.transfer_events (transfer_id, event, variant_id, qty) values (v_id, 'request', v_line.variant_id, v_line.qty);
+  end loop;
+  return v_id;
+end;
+$$;
+
+-- الاعتماد يحجز الكمية من «المتاح» في المصدر. p_items اختياري لتعديل الكميات المعتمدة (0 = استبعاد)
+create or replace function public.approve_transfer(p_id uuid, p_items jsonb default null, p_note text default null)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.transfers;
+  v_item record;
+  v_qty integer;
+  v_available integer;
+  v_seg boolean := (select inventory_segregation from public.store_settings where id = 1);
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into t from public.transfers where id = p_id for update;
+  if t.id is null or t.status <> 'requested' then
+    raise exception 'التحويل ليس بانتظار الاعتماد';
+  end if;
+  if v_seg and t.requested_by = auth.uid() then
+    raise exception 'فصل المهام: لا يمكنك اعتماد طلب أنشأته بنفسك';
+  end if;
+
+  for v_item in select * from public.transfer_items where transfer_id = p_id order by variant_id loop
+    v_qty := coalesce((select (e ->> 'qty')::integer from jsonb_array_elements(coalesce(p_items, '[]'::jsonb)) e
+                        where (e ->> 'variant_id')::uuid = v_item.variant_id), v_item.qty_requested);
+    if v_qty < 0 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+    -- قفل رصيد المصدر لمنع اعتمادين متزامنين يتجاوزان المتاح
+    perform 1 from public.location_stock where location_id = t.from_location and variant_id = v_item.variant_id for update;
+    v_available := coalesce((select qty from public.location_stock where location_id = t.from_location and variant_id = v_item.variant_id), 0)
+                   - public._outgoing_pending(t.from_location, v_item.variant_id, p_id);
+    if v_qty > v_available then
+      raise exception 'المتاح في المصدر من الصنف % هو % فقط',
+        (select sku from public.product_variants where id = v_item.variant_id), greatest(v_available, 0);
+    end if;
+    update public.transfer_items set qty_approved = v_qty where id = v_item.id;
+    insert into public.transfer_events (transfer_id, event, variant_id, qty, note)
+    values (p_id, 'approve', v_item.variant_id, v_qty, nullif(trim(p_note), ''));
+  end loop;
+  if not exists (select 1 from public.transfer_items where transfer_id = p_id and qty_approved > 0) then
+    raise exception 'لا توجد كميات معتمدة — استخدم الرفض بدلاً من ذلك';
+  end if;
+  update public.transfers set status = 'approved', approved_by = auth.uid(), approved_at = now() where id = p_id;
+end;
+$$;
+
+-- رفض (للمدير) أو إلغاء (صاحب الطلب قبل الاعتماد، أو المدير قبل أي شحن)
+create or replace function public.close_transfer(p_id uuid, p_reason text, p_reject boolean default false)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.transfers;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  select * into t from public.transfers where id = p_id for update;
+  if t.id is null then
+    raise exception 'التحويل غير موجود';
+  end if;
+  if p_reject then
+    if not public.is_manager() or t.status <> 'requested' then
+      raise exception 'لا يمكن رفض هذا التحويل';
+    end if;
+  else
+    if exists (select 1 from public.transfer_items where transfer_id = p_id and qty_shipped > 0) then
+      raise exception 'تم شحن جزء من التحويل — لا يمكن إلغاؤه (استلم أو اعتمد الفرق)';
+    end if;
+    if not (t.status = 'requested' and (t.requested_by = auth.uid() or public.is_manager())
+            or t.status = 'approved' and public.is_manager()) then
+      raise exception 'لا يمكن إلغاء هذا التحويل';
+    end if;
+  end if;
+  update public.transfers
+     set status = case when p_reject then 'rejected'::public.transfer_status else 'cancelled'::public.transfer_status end,
+         closed_by = auth.uid(), closed_at = now(), close_reason = trim(p_reason)
+   where id = p_id;
+  insert into public.transfer_events (transfer_id, event, note)
+  values (p_id, case when p_reject then 'reject' else 'cancel' end, trim(p_reason));
+end;
+$$;
+
+-- الشحن: من المصدر إلى «في الطريق». p_items null = كل المتبقي المعتمد.
+-- p_close_remaining: إنهاء الشحن (ما لم يُشحن يُلغى من المعتمد)
+create or replace function public.ship_transfer(
+  p_id uuid, p_items jsonb default null, p_close_remaining boolean default false, p_client_ref uuid default null
+) returns public.transfer_status
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.transfers;
+  v_item record;
+  v_qty integer;
+  v_transit uuid := public._transit_location();
+  v_any boolean := false;
+begin
+  select * into t from public.transfers where id = p_id for update;
+  if t.id is null then
+    raise exception 'التحويل غير موجود';
+  end if;
+  if not public._can_act_at(t.from_location) then
+    raise exception 'الشحن من موظفي موقع المصدر أو المدير';
+  end if;
+  if public._op_seen(p_client_ref, 'ship', p_id) then
+    return t.status;
+  end if;
+  if t.status not in ('approved', 'in_transit') then
+    raise exception 'لا يمكن الشحن في حالة التحويل الحالية';
+  end if;
+
+  for v_item in select * from public.transfer_items where transfer_id = p_id order by variant_id loop
+    v_qty := case when p_items is null then v_item.qty_approved - v_item.qty_shipped
+                  else coalesce((select (e ->> 'qty')::integer from jsonb_array_elements(p_items) e
+                                  where (e ->> 'variant_id')::uuid = v_item.variant_id), 0) end;
+    if v_qty < 0 or v_qty > v_item.qty_approved - v_item.qty_shipped then
+      raise exception 'كمية الشحن للصنف % تتجاوز المعتمد المتبقي (%)',
+        (select sku from public.product_variants where id = v_item.variant_id), v_item.qty_approved - v_item.qty_shipped;
+    end if;
+    if v_qty > 0 then
+      -- لا مخزون سالب في المصدر (القفل داخل _apply_location يمنع شحنين متزامنين يتجاوزان الرصيد)
+      perform public._apply_location(t.from_location, v_item.variant_id, -v_qty, 'transfer_out', null, p_id, null, t.transfer_no, true);
+      perform public._apply_location(v_transit, v_item.variant_id, v_qty, 'transit_in', null, p_id, null, t.transfer_no, false);
+      update public.transfer_items set qty_shipped = qty_shipped + v_qty where id = v_item.id;
+      insert into public.transfer_events (transfer_id, event, variant_id, qty) values (p_id, 'ship', v_item.variant_id, v_qty);
+      v_any := true;
+    end if;
+  end loop;
+
+  if p_close_remaining then
+    update public.transfer_items set qty_approved = qty_shipped where transfer_id = p_id and qty_approved > qty_shipped;
+    insert into public.transfer_events (transfer_id, event, note) values (p_id, 'close_remaining', 'إنهاء الشحن');
+  elsif not v_any then
+    raise exception 'لا توجد كميات للشحن';
+  end if;
+  return public._transfer_refresh(p_id, false);
+end;
+$$;
+
+-- الاستلام: من «في الطريق» إلى الوجهة. p_items null = كل المشحون غير المستلم.
+-- p_finalize: إنهاء الاستلام — أي نقص يبقى فرقاً معلقاً في «في الطريق» (short_received) حتى يُعتمد كفقد أو يصل لاحقاً
+create or replace function public.receive_transfer(
+  p_id uuid, p_items jsonb default null, p_finalize boolean default true, p_client_ref uuid default null
+) returns public.transfer_status
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.transfers;
+  v_item record;
+  v_qty integer;
+  v_transit uuid := public._transit_location();
+  v_any boolean := false;
+begin
+  select * into t from public.transfers where id = p_id for update;
+  if t.id is null then
+    raise exception 'التحويل غير موجود';
+  end if;
+  if not public._can_act_at(t.to_location) then
+    raise exception 'الاستلام من موظفي موقع الوجهة أو المدير';
+  end if;
+  if public._op_seen(p_client_ref, 'receive', p_id) then
+    return t.status;
+  end if;
+  if t.status not in ('in_transit', 'short_received') then
+    raise exception 'لا توجد كمية بانتظار الاستلام في هذا التحويل';
+  end if;
+
+  for v_item in select * from public.transfer_items where transfer_id = p_id order by variant_id loop
+    v_qty := case when p_items is null then v_item.qty_shipped - v_item.qty_received - v_item.qty_lost
+                  else coalesce((select (e ->> 'qty')::integer from jsonb_array_elements(p_items) e
+                                  where (e ->> 'variant_id')::uuid = v_item.variant_id), 0) end;
+    if v_qty < 0 or v_qty > v_item.qty_shipped - v_item.qty_received - v_item.qty_lost then
+      raise exception 'الكمية المستلمة للصنف % أكبر من المشحون المتبقي (%)',
+        (select sku from public.product_variants where id = v_item.variant_id),
+        v_item.qty_shipped - v_item.qty_received - v_item.qty_lost;
+    end if;
+    if v_qty > 0 then
+      perform public._apply_location(v_transit, v_item.variant_id, -v_qty, 'transit_out', null, p_id, null, t.transfer_no, true);
+      perform public._apply_location(t.to_location, v_item.variant_id, v_qty, 'transfer_in', null, p_id, null, t.transfer_no, false);
+      update public.transfer_items set qty_received = qty_received + v_qty where id = v_item.id;
+      insert into public.transfer_events (transfer_id, event, variant_id, qty) values (p_id, 'receive', v_item.variant_id, v_qty);
+      v_any := true;
+    end if;
+  end loop;
+  if not v_any and not p_finalize then
+    raise exception 'لا توجد كميات للاستلام';
+  end if;
+  if p_finalize then
+    insert into public.transfer_events (transfer_id, event) values (p_id, 'finalize');
+  end if;
+  return public._transfer_refresh(p_id, p_finalize);
+end;
+$$;
+
+-- اعتماد فرق التحويل كفقد نهائي (المالك/المدير، سبب إلزامي، مع فصل المهام إن كان مفعلاً)
+create or replace function public.resolve_transfer_loss(
+  p_id uuid, p_variant uuid, p_qty integer, p_reason text, p_client_ref uuid default null
+) returns public.transfer_status
+language plpgsql security definer set search_path = public as $$
+declare
+  t public.transfers;
+  v_item public.transfer_items;
+  v_seg boolean := (select inventory_segregation from public.store_settings where id = 1);
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'سبب اعتماد الفقد مطلوب';
+  end if;
+  select * into t from public.transfers where id = p_id for update;
+  if t.id is null or t.status <> 'short_received' then
+    raise exception 'لا يوجد فرق معلق في هذا التحويل';
+  end if;
+  if public._op_seen(p_client_ref, 'loss', p_id) then
+    return t.status;
+  end if;
+  select * into v_item from public.transfer_items where transfer_id = p_id and variant_id = p_variant for update;
+  if v_item.id is null or p_qty is null or p_qty <= 0
+     or p_qty > v_item.qty_shipped - v_item.qty_received - v_item.qty_lost then
+    raise exception 'كمية الفقد أكبر من الفرق المعلق';
+  end if;
+  if v_seg and v_item.discrepancy_by = auth.uid() then
+    raise exception 'فصل المهام: لا يمكنك اعتماد فرق سجّلته بنفسك';
+  end if;
+
+  -- الفقد يخفض الإجمالي عبر _move_stock، ونسبته إلى موقع «في الطريق»
+  perform set_config('app.location_id', public._transit_location()::text, true);
+  perform set_config('app.location_type', 'transit_loss', true);
+  perform public._move_stock(p_variant, -p_qty, 'adjustment', p_id, 'فقد تحويل ' || t.transfer_no || ': ' || trim(p_reason), false);
+  perform set_config('app.location_id', '', true);
+  perform set_config('app.location_type', '', true);
+
+  update public.transfer_items set qty_lost = qty_lost + p_qty where id = v_item.id;
+  insert into public.transfer_events (transfer_id, event, variant_id, qty, note)
+  values (p_id, 'loss', p_variant, p_qty, trim(p_reason));
+  return public._transfer_refresh(p_id, false);
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- إدارة المواقع (المالك)
+-- ---------------------------------------------------------------------
+create or replace function public.set_staff_location(p_profile uuid, p_location uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.has_role('owner') then
+    raise exception 'غير مصرح';
+  end if;
+  if p_location is null then
+    delete from public.staff_locations where profile_id = p_profile;
+    return;
+  end if;
+  if (select kind from public.locations where id = p_location and is_active) is null
+     or (select kind from public.locations where id = p_location) = 'transit' then
+    raise exception 'موقع غير صالح';
+  end if;
+  insert into public.staff_locations (profile_id, location_id) values (p_profile, p_location)
+  on conflict (profile_id) do update set location_id = excluded.location_id, updated_at = now();
+end;
+$$;
+
+-- لا يُعطَّل موقع فيه مخزون أو تحويلات مفتوحة، ولا يُعدَّل نوع «في الطريق»
+create or replace function public.locations_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'UPDATE' then
+    if old.kind = 'transit' and (new.kind <> 'transit' or not new.is_active) then
+      raise exception 'موقع «في الطريق» موقع نظام';
+    end if;
+    if new.kind = 'transit' and old.kind <> 'transit' then
+      raise exception 'لا يمكن تحويل موقع إلى «في الطريق»';
+    end if;
+    if old.is_active and not new.is_active then
+      if exists (select 1 from public.location_stock where location_id = old.id and qty <> 0) then
+        raise exception 'لا يمكن تعطيل موقع فيه مخزون — انقله أولاً';
+      end if;
+      if exists (select 1 from public.transfers where old.id in (from_location, to_location)
+                  and status in ('requested', 'approved', 'in_transit', 'short_received')) then
+        raise exception 'لا يمكن تعطيل موقع له تحويلات مفتوحة';
+      end if;
+    end if;
+  elsif tg_op = 'INSERT' and new.kind = 'transit' then
+    raise exception 'موقع «في الطريق» موجود مسبقاً';
+  end if;
+  return new;
+end;
+$$;
+create trigger locations_guard before insert or update on public.locations
+  for each row execute function public.locations_guard();
+
+-- ---------------------------------------------------------------------
+-- RLS والصلاحيات
+-- ---------------------------------------------------------------------
+alter table public.locations enable row level security;
+alter table public.staff_locations enable row level security;
+alter table public.location_stock enable row level security;
+alter table public.location_movements enable row level security;
+alter table public.transfers enable row level security;
+alter table public.transfer_items enable row level security;
+alter table public.transfer_events enable row level security;
+alter table public.inventory_ops enable row level security;
+
+revoke all on public.locations, public.staff_locations, public.location_stock, public.location_movements,
+  public.transfers, public.transfer_items, public.transfer_events, public.inventory_ops from anon;
+revoke usage on sequence public.transfer_seq from anon;
+revoke insert, update, delete on public.staff_locations, public.location_stock, public.location_movements,
+  public.transfers, public.transfer_items, public.transfer_events, public.inventory_ops from authenticated;
+revoke all on public.inventory_ops from authenticated;
+grant select on public.locations, public.staff_locations, public.location_stock, public.location_movements,
+  public.transfers, public.transfer_items, public.transfer_events to authenticated;
+grant insert, update on public.locations to authenticated;
+revoke delete on public.locations from authenticated;
+
+create policy locations_select on public.locations for select to authenticated using (public.is_staff());
+create policy locations_insert on public.locations for insert to authenticated with check (public.has_role('owner'));
+create policy locations_update on public.locations for update to authenticated
+  using (public.has_role('owner')) with check (public.has_role('owner'));
+create policy staff_locations_select on public.staff_locations for select to authenticated
+  using (public.is_manager() or profile_id = auth.uid());
+create policy location_stock_select on public.location_stock for select to authenticated using (public.is_staff());
+create policy location_movements_select on public.location_movements for select to authenticated using (public.is_manager());
+create policy transfers_select on public.transfers for select to authenticated
+  using (public.is_manager() or (public.is_staff() and public._my_location() in (from_location, to_location)));
+create policy transfer_items_select on public.transfer_items for select to authenticated
+  using (exists (select 1 from public.transfers t where t.id = transfer_id));
+create policy transfer_events_select on public.transfer_events for select to authenticated
+  using (exists (select 1 from public.transfers t where t.id = transfer_id));
+
+create trigger locations_audit after insert or update or delete on public.locations
+  for each row execute function public.audit_trigger();
+create trigger staff_locations_audit after insert or update or delete on public.staff_locations
+  for each row execute function public.audit_trigger();
+create trigger transfers_audit after insert or update or delete on public.transfers
+  for each row execute function public.audit_trigger();
+create trigger transfer_items_audit after insert or update or delete on public.transfer_items
+  for each row execute function public.audit_trigger();
+
+-- الدوال الداخلية لا تُستدعى مباشرة
+revoke all on function
+  public._default_location(), public._transit_location(), public._my_location(), public._multi_location(),
+  public._best_other_location(uuid, uuid),
+  public._apply_location(uuid, uuid, integer, public.loc_movement_type, bigint, uuid, uuid, text, boolean),
+  public.attribute_stock_movement(), public._check_location_invariant(uuid),
+  public.location_stock_invariant(), public.variant_stock_invariant(),
+  public.shift_set_location(), public.purchase_set_location(), public._op_seen(uuid, text, uuid),
+  public._outgoing_pending(uuid, uuid, uuid), public._can_act_at(uuid), public._transfer_refresh(uuid, boolean),
+  public.locations_guard()
+from public, anon, authenticated;
+
+revoke execute on function
+  public.adjust_location_stock(uuid, uuid, integer, text, uuid),
+  public.request_transfer(uuid, uuid, jsonb, text, uuid),
+  public.approve_transfer(uuid, jsonb, text),
+  public.close_transfer(uuid, text, boolean),
+  public.ship_transfer(uuid, jsonb, boolean, uuid),
+  public.receive_transfer(uuid, jsonb, boolean, uuid),
+  public.resolve_transfer_loss(uuid, uuid, integer, text, uuid),
+  public.set_staff_location(uuid, uuid)
+from public, anon;
+grant execute on function
+  public.adjust_location_stock(uuid, uuid, integer, text, uuid),
+  public.request_transfer(uuid, uuid, jsonb, text, uuid),
+  public.approve_transfer(uuid, jsonb, text),
+  public.close_transfer(uuid, text, boolean),
+  public.ship_transfer(uuid, jsonb, boolean, uuid),
+  public.receive_transfer(uuid, jsonb, boolean, uuid),
+  public.resolve_transfer_loss(uuid, uuid, integer, text, uuid),
+  public.set_staff_location(uuid, uuid)
+to authenticated;
+
+-- =====================================================================
+-- 0014_smart_counts.sql
+-- =====================================================================
+-- =====================================================================
+-- Smart Inventory 2.0 — (2) الجرد الذكي حسب الموقع
+--   • جلسة جرد لكل موقع، مسح بالباركود/SKU من الجوال أو القارئ
+--   • كل مسحة سطر مستقل بمفتاح فريد (client_ref): نفس المسحة لا تُحسب مرتين، وجهازان يعدّان نفس الصنف
+--     تُجمع مسحاتهما ولا يلغي أحدهما الآخر
+--   • الكمية النظامية وقت العدّ = لقطة البداية + حركات الموقع بعد اللقطة حتى لحظة عدّ الصنف
+--     فالبيع أثناء الجرد لا يصنع فرقاً وهمياً، والتسوية = المعدود − النظامي وقت العدّ، تُضاف للرصيد الحالي
+--   • الكاشير لا يرى الكمية النظامية (جرد أعمى على مستوى قاعدة البيانات)
+--   • لا تسوية قبل اعتماد المدير، ولا تسوية تجعل مخزون الموقع سالباً
+-- =====================================================================
+
+alter type public.count_status add value if not exists 'submitted';
+
+alter table public.stock_counts
+  add column snapshot_at timestamptz,
+  add column submitted_by uuid references public.profiles (id),
+  add column submitted_at timestamptz,
+  add column cancel_reason text;
+
+create table public.stock_count_scans (
+  id bigint generated always as identity primary key,
+  count_id uuid not null references public.stock_counts (id) on delete cascade,
+  variant_id uuid not null references public.product_variants (id) on delete cascade,
+  qty integer not null check (qty <> 0),       -- +1 لكل مسحة، أو تصحيح يدوي (±)
+  client_ref uuid unique,
+  scanned_by uuid references public.profiles (id) default auth.uid(),
+  scanned_at timestamptz not null default clock_timestamp()
+);
+create index stock_count_scans_count_idx on public.stock_count_scans (count_id, variant_id);
+
+-- كمية الموقع في لحظة ماضية = الرصيد الحالي − حركات الموقع بعد تلك اللحظة
+create or replace function public._location_qty_at(p_location uuid, p_variant uuid, p_at timestamptz)
+returns integer language sql stable security definer set search_path = public as $$
+  select coalesce((select qty from public.location_stock where location_id = p_location and variant_id = p_variant), 0)
+       - coalesce((select sum(qty_change) from public.location_movements
+                    where location_id = p_location and variant_id = p_variant and created_at > p_at), 0)::integer
+$$;
+
+create or replace function public.start_location_count(
+  p_location uuid, p_category_id uuid default null, p_notes text default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if (select kind from public.locations where id = p_location and is_active) not in ('store', 'warehouse') then
+    raise exception 'موقع غير صالح';
+  end if;
+  if exists (select 1 from public.stock_counts where location_id = p_location and status in ('open', 'submitted')) then
+    raise exception 'يوجد جرد مفتوح لهذا الموقع — أكمله أو ألغه أولاً';
+  end if;
+
+  insert into public.stock_counts (count_no, category_id, notes, location_id, snapshot_at)
+  values (
+    'CNT-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.count_seq')::text, 4, '0'),
+    p_category_id, nullif(trim(p_notes), ''), p_location, clock_timestamp()
+  ) returning id into v_id;
+
+  -- اللقطة: رصيد الموقع لحظة البدء لكل صنف نشط (ضمن التصنيف إن وُجد)
+  insert into public.stock_count_items (count_id, variant_id, expected_qty)
+  select v_id, v.id, coalesce(s.qty, 0)
+    from public.product_variants v
+    join public.products p on p.id = v.product_id
+    left join public.location_stock s on s.variant_id = v.id and s.location_id = p_location
+   where v.is_active and p.is_active and (p_category_id is null or p.category_id = p_category_id);
+  return v_id;
+end;
+$$;
+
+-- مسحة: p_code = باركود أو SKU. p_qty افتراضياً 1. صنف غير مدرج يُضاف للجرد (مع لقطته)
+create or replace function public.record_count_scan(
+  p_count_id uuid, p_code text, p_qty integer default 1, p_client_ref uuid default null
+) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  c public.stock_counts;
+  v_variant record;
+  v_item public.stock_count_items;
+  v_code text := trim(coalesce(p_code, ''));
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into c from public.stock_counts where id = p_count_id;
+  if c.id is null or c.status <> 'open' then
+    raise exception 'الجرد غير مفتوح';
+  end if;
+
+  select v.id, v.sku, p.name, nullif(concat_ws(' / ', v.size, v.color), '') as label into v_variant
+    from public.product_variants v join public.products p on p.id = v.product_id
+   where v.barcode = v_code or lower(v.sku) = lower(v_code)
+   order by (v.barcode = v_code) desc limit 1;
+  if v_variant.id is null then
+    raise exception 'لا يوجد صنف بالرمز %', v_code;
+  end if;
+
+  -- نفس المسحة أُرسلت سابقاً (ضغط مزدوج/إعادة إرسال): لا تُحسب مرة ثانية
+  if p_client_ref is not null and exists (select 1 from public.stock_count_scans where client_ref = p_client_ref) then
+    select * into v_item from public.stock_count_items where count_id = p_count_id and variant_id = v_variant.id;
+    return jsonb_build_object('variant_id', v_variant.id, 'sku', v_variant.sku, 'name', v_variant.name,
+                              'label', v_variant.label, 'counted', v_item.counted_qty, 'duplicate', true);
+  end if;
+  if coalesce(p_qty, 0) = 0 then
+    raise exception 'كمية غير صحيحة';
+  end if;
+
+  insert into public.stock_count_items (count_id, variant_id, expected_qty)
+  values (p_count_id, v_variant.id,
+          case when c.location_id is null then (select stock_qty from public.product_variants where id = v_variant.id)
+               else public._location_qty_at(c.location_id, v_variant.id, c.snapshot_at) end)
+  on conflict (count_id, variant_id) do nothing;
+
+  -- التحديث يقفل الصف: مسحات متزامنة لنفس الصنف تُجمع بالترتيب
+  update public.stock_count_items
+     set counted_qty = coalesce(counted_qty, 0) + p_qty, counted_by = auth.uid(), counted_at = clock_timestamp()
+   where count_id = p_count_id and variant_id = v_variant.id
+  returning * into v_item;
+  if v_item.counted_qty < 0 then
+    raise exception 'الكمية المعدودة لا تكون سالبة';
+  end if;
+  insert into public.stock_count_scans (count_id, variant_id, qty, client_ref) values (p_count_id, v_variant.id, p_qty, p_client_ref);
+
+  return jsonb_build_object('variant_id', v_variant.id, 'sku', v_variant.sku, 'name', v_variant.name,
+                            'label', v_variant.label, 'counted', v_item.counted_qty, 'duplicate', false);
+end;
+$$;
+
+-- إدخال الكمية المعدودة مباشرة (تُسجَّل كمسحة تصحيح بالفرق)
+create or replace function public.set_count_qty(p_count_id uuid, p_variant uuid, p_qty integer, p_client_ref uuid default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_current integer;
+begin
+  if p_qty is null or p_qty < 0 then
+    raise exception 'كمية غير صحيحة';
+  end if;
+  select coalesce(counted_qty, 0) into v_current from public.stock_count_items
+   where count_id = p_count_id and variant_id = p_variant for update;
+  if p_qty = coalesce(v_current, 0) then
+    update public.stock_count_items set counted_qty = p_qty, counted_by = auth.uid(), counted_at = clock_timestamp()
+     where count_id = p_count_id and variant_id = p_variant and counted_qty is null;
+    return jsonb_build_object('counted', p_qty);
+  end if;
+  return public.record_count_scan(p_count_id, (select sku from public.product_variants where id = p_variant),
+                                  p_qty - coalesce(v_current, 0), p_client_ref);
+end;
+$$;
+
+create or replace function public.submit_count(p_count_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  update public.stock_counts set status = 'submitted', submitted_by = auth.uid(), submitted_at = now()
+   where id = p_count_id and status = 'open';
+  if not found then
+    raise exception 'الجرد غير مفتوح';
+  end if;
+end;
+$$;
+
+create or replace function public.reopen_count(p_count_id uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  update public.stock_counts set status = 'open' where id = p_count_id and status = 'submitted';
+  if not found then
+    raise exception 'الجرد ليس بانتظار الاعتماد';
+  end if;
+end;
+$$;
+
+-- مراجعة الفروقات (للمدير): النظامي وقت العدّ، المعدود، الفرق، قيمته
+create or replace function public.count_review(p_count_id uuid)
+returns table (
+  variant_id uuid, sku text, product_name text, variant_label text,
+  snapshot_qty integer, moves_after_snapshot integer, expected_qty integer,
+  counted_qty integer, variance integer, unit_cost numeric, variance_value numeric,
+  counted_at timestamptz, current_qty integer
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  c public.stock_counts;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into c from public.stock_counts where id = p_count_id;
+  if c.id is null then
+    raise exception 'الجرد غير موجود';
+  end if;
+  return query
+  with base as (
+    select i.variant_id, v.sku, p.name, nullif(concat_ws(' / ', v.size, v.color), '') as label,
+           i.expected_qty as snap, i.counted_qty, i.counted_at, coalesce(vc.cost_price, 0) as cost,
+           case when c.location_id is null then v.stock_qty
+                else coalesce((select s.qty from public.location_stock s
+                                where s.location_id = c.location_id and s.variant_id = i.variant_id), 0) end as cur,
+           -- حركات الموقع بعد اللقطة حتى لحظة عدّ الصنف (أو حتى الآن إن لم يُعدّ)، دون تسويات هذا الجرد نفسه
+           case when c.location_id is null or c.snapshot_at is null then 0
+                else coalesce((select sum(m.qty_change) from public.location_movements m
+                                where m.location_id = c.location_id and m.variant_id = i.variant_id
+                                  and m.created_at > c.snapshot_at
+                                  and m.created_at <= coalesce(i.counted_at, clock_timestamp())
+                                  and m.ref_id is distinct from c.id), 0)::integer end as moves
+      from public.stock_count_items i
+      join public.product_variants v on v.id = i.variant_id
+      join public.products p on p.id = v.product_id
+      left join public.variant_costs vc on vc.variant_id = i.variant_id
+     where i.count_id = p_count_id
+  )
+  select b.variant_id, b.sku, b.name, b.label, b.snap, b.moves, b.snap + b.moves,
+         b.counted_qty, b.counted_qty - (b.snap + b.moves), b.cost,
+         round((b.counted_qty - (b.snap + b.moves)) * b.cost, 2), b.counted_at, b.cur
+    from base b
+   order by b.name, b.label;
+end;
+$$;
+
+-- الاعتماد: التسوية = المعدود − النظامي وقت العدّ. p_uncounted_as_zero للجرد الكامل (غير المعدود = صفر)
+create or replace function public.approve_count(p_count_id uuid, p_uncounted_as_zero boolean default false, p_note text default null)
+returns integer
+language plpgsql security definer set search_path = public as $$
+declare
+  c public.stock_counts;
+  r record;
+  v_delta integer;
+  v_changed integer := 0;
+  v_current integer;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into c from public.stock_counts where id = p_count_id for update;
+  if c.id is null or c.status not in ('open', 'submitted') then
+    raise exception 'الجرد غير موجود أو مغلق';
+  end if;
+  if c.location_id is null then
+    raise exception 'جرد قديم بدون موقع — استخدم الاعتماد القديم';
+  end if;
+
+  for r in select * from public.count_review(p_count_id) loop
+    if r.counted_qty is null then
+      continue when not p_uncounted_as_zero;
+      v_delta := 0 - r.expected_qty;
+    else
+      v_delta := r.variance;
+    end if;
+    continue when v_delta = 0;
+    perform 1 from public.location_stock where location_id = c.location_id and variant_id = r.variant_id for update;
+    v_current := coalesce((select qty from public.location_stock where location_id = c.location_id and variant_id = r.variant_id), 0);
+    if v_current + v_delta < 0 then
+      raise exception 'تسوية الصنف % تجعل مخزون الموقع سالباً (الحالي %، الفرق %) — راجع العدّ',
+        r.sku, v_current, v_delta;
+    end if;
+    -- تُنسب للموقع عبر stock_counts.location_id، وتغيّر الإجمالي بنفس المقدار
+    perform public._move_stock(r.variant_id, v_delta, 'count', p_count_id,
+                               c.count_no || coalesce(' — ' || nullif(trim(p_note), ''), ''), false);
+    v_changed := v_changed + 1;
+  end loop;
+
+  update public.stock_counts set status = 'applied', applied_at = now(), applied_by = auth.uid()
+   where id = p_count_id;
+  return v_changed;
+end;
+$$;
+
+create or replace function public.cancel_count(p_count_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  update public.stock_counts set status = 'cancelled', cancel_reason = trim(p_reason)
+   where id = p_count_id and status in ('open', 'submitted');
+  if not found then
+    raise exception 'الجرد غير مفتوح';
+  end if;
+end;
+$$;
+
+-- الدوال القديمة: تعمل كما هي لمتجر بموقع واحد، وترفض عند تعدد المواقع (تقارن بالإجمالي لا بالموقع)
+create or replace function public.guard_legacy_count()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.location_id is null and public._multi_location() then
+    raise exception 'تعدد المواقع: استخدم الجرد حسب الموقع';
+  end if;
+  return new;
+end;
+$$;
+create trigger stock_counts_guard_legacy before insert on public.stock_counts
+  for each row execute function public.guard_legacy_count();
+
+create or replace function public.guard_legacy_apply()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'applied' and old.status <> 'applied' and new.location_id is null and public._multi_location() then
+    raise exception 'تعدد المواقع: اعتماد الجرد القديم غير متاح';
+  end if;
+  return new;
+end;
+$$;
+create trigger stock_counts_guard_legacy_apply before update of status on public.stock_counts
+  for each row execute function public.guard_legacy_apply();
+
+-- جرد أعمى: الكمية النظامية لا تُقرأ مباشرة (المدير يراها عبر count_review)، والعدّ عبر الدوال فقط
+revoke select, update on public.stock_count_items from authenticated;
+grant select (id, count_id, variant_id, counted_qty, counted_by, counted_at) on public.stock_count_items to authenticated;
+
+alter table public.stock_count_scans enable row level security;
+revoke all on public.stock_count_scans from anon;
+revoke insert, update, delete on public.stock_count_scans from authenticated;
+grant select on public.stock_count_scans to authenticated;
+create policy count_scans_select on public.stock_count_scans for select to authenticated using (public.is_staff());
+
+revoke all on function public._location_qty_at(uuid, uuid, timestamptz), public.guard_legacy_count(),
+  public.guard_legacy_apply() from public, anon, authenticated;
+revoke execute on function
+  public.start_location_count(uuid, uuid, text),
+  public.record_count_scan(uuid, text, integer, uuid),
+  public.set_count_qty(uuid, uuid, integer, uuid),
+  public.submit_count(uuid), public.reopen_count(uuid),
+  public.count_review(uuid),
+  public.approve_count(uuid, boolean, text),
+  public.cancel_count(uuid, text)
+from public, anon;
+grant execute on function
+  public.start_location_count(uuid, uuid, text),
+  public.record_count_scan(uuid, text, integer, uuid),
+  public.set_count_qty(uuid, uuid, integer, uuid),
+  public.submit_count(uuid), public.reopen_count(uuid),
+  public.count_review(uuid),
+  public.approve_count(uuid, boolean, text),
+  public.cancel_count(uuid, text)
+to authenticated;
+
+-- =====================================================================
+-- 0015_inventory_intelligence.sql
+-- =====================================================================
+-- =====================================================================
+-- Smart Inventory 2.0 — (3) التوفر لكل موقع + ذكاء المخزون (قراءة فقط)
+--   On Hand      : الموجود فعلياً في الموقع (location_stock)
+--   Reserved     : محجوز لعملاء (من حجوزات Sales 2.0 إن وُجدت — تُنسب للموقع الرئيسي)
+--   Outgoing     : معتمد للتحويل ولم يُشحن بعد
+--   Available    : On Hand − Reserved − Outgoing   (المتاح للبيع أو النقل)
+--   In Transit   : مشحون إلى الموقع ولم يُستلم بعد
+--   المبيعات تُنسب للموقع عبر وردية الكاشير (الوردية بلا موقع = الرئيسي)
+-- =====================================================================
+
+-- الحجوزات (إن كانت حزمة Sales 2.0 مثبتة) — بدون اعتماد عليها في وقت التثبيت
+create or replace function public._reserved_map()
+returns table (location_id uuid, variant_id uuid, qty integer)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if to_regclass('public.reservation_items') is null or to_regclass('public.reservations') is null then
+    return;
+  end if;
+  return query execute
+    'select $1, i.variant_id, sum(i.qty)::integer
+       from public.reservation_items i join public.reservations r on r.id = i.reservation_id
+      where r.status::text = ''active'' and r.expires_at > now()
+      group by i.variant_id'
+    using public._default_location();
+end;
+$$;
+
+-- المبيعات الصافية لكل موقع وصنف (بعد المرتجعات) في نوافذ 7/30/60/90 يوماً + آخر بيع
+create or replace function public._location_sales()
+returns table (location_id uuid, variant_id uuid, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz)
+language sql stable security definer set search_path = public as $$
+  with d as (select public._default_location() as def),
+  s as (
+    select coalesce(sh.location_id, d.def) as loc, si.variant_id, si.qty, sa.created_at
+      from public.sale_items si
+      join public.sales sa on sa.id = si.sale_id
+      left join public.shifts sh on sh.id = sa.shift_id
+      cross join d
+     where sa.created_at >= now() - interval '90 days'
+  ),
+  r as (
+    select coalesce(rsh.location_id, ssh.location_id, d.def) as loc, ri.variant_id, ri.qty, re.created_at
+      from public.return_items ri
+      join public.returns re on re.id = ri.return_id
+      join public.sales sa on sa.id = re.sale_id
+      left join public.shifts rsh on rsh.id = re.shift_id
+      left join public.shifts ssh on ssh.id = sa.shift_id
+      cross join d
+     where re.created_at >= now() - interval '90 days'
+  ),
+  signed as (
+    select loc, variant_id, qty, created_at from s
+    union all select loc, variant_id, -qty, created_at from r
+  ),
+  last_sale as (
+    select coalesce(sh.location_id, d.def) as loc, si.variant_id, max(sa.created_at) as at
+      from public.sale_items si
+      join public.sales sa on sa.id = si.sale_id
+      left join public.shifts sh on sh.id = sa.shift_id
+      cross join d
+     group by 1, 2
+  ),
+  agg as (
+    select loc, variant_id,
+           greatest(coalesce(sum(qty) filter (where created_at >= now() - interval '7 days'), 0), 0)::integer as n7,
+           greatest(coalesce(sum(qty) filter (where created_at >= now() - interval '30 days'), 0), 0)::integer as n30,
+           greatest(coalesce(sum(qty) filter (where created_at >= now() - interval '60 days'), 0), 0)::integer as n60,
+           greatest(coalesce(sum(qty), 0), 0)::integer as n90
+      from signed group by loc, variant_id
+  )
+  select coalesce(a.loc, l.loc), coalesce(a.variant_id, l.variant_id),
+         coalesce(a.n7, 0), coalesce(a.n30, 0), coalesce(a.n60, 0), coalesce(a.n90, 0), l.at
+    from agg a full join last_sale l on l.loc = a.loc and l.variant_id = a.variant_id
+$$;
+
+-- لكل موقع (متجر/مستودع) وصنف: الكميات الخمس + المبيعات + التكلفة والسعر
+create or replace function public.location_availability(p_location uuid default null)
+returns table (
+  location_id uuid, location_name text, location_kind public.location_kind,
+  variant_id uuid, product_id uuid, product_name text, category_id uuid, sku text, barcode text,
+  size text, color text, on_hand integer, reserved integer, outgoing integer, available integer, in_transit integer,
+  n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
+  unit_cost numeric, unit_price numeric, age_days integer
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with locs as (
+    select l.* from public.locations l
+     where l.is_active and l.kind in ('store', 'warehouse') and (p_location is null or l.id = p_location)
+  ),
+  res as (select * from public._reserved_map()),
+  outg as (
+    select t.from_location as loc, i.variant_id, sum(i.qty_approved - i.qty_shipped)::integer as qty
+      from public.transfer_items i join public.transfers t on t.id = i.transfer_id
+     where t.status in ('approved', 'in_transit') group by 1, 2
+  ),
+  incoming as (
+    select t.to_location as loc, i.variant_id, sum(i.qty_shipped - i.qty_received - i.qty_lost)::integer as qty
+      from public.transfer_items i join public.transfers t on t.id = i.transfer_id
+     where t.status in ('in_transit', 'short_received') group by 1, 2
+  ),
+  sales as (select * from public._location_sales()),
+  pairs as (
+    select l.id as loc, v.id as variant_id
+      from locs l cross join public.product_variants v
+      join public.products p on p.id = v.product_id
+     where (v.is_active and p.is_active)
+        or exists (select 1 from public.location_stock s where s.location_id = l.id and s.variant_id = v.id and s.qty <> 0)
+  )
+  select l.id, l.name, l.kind, v.id, p.id, p.name, p.category_id, v.sku, v.barcode, v.size, v.color,
+         coalesce(s.qty, 0), coalesce(r.qty, 0), coalesce(o.qty, 0),
+         coalesce(s.qty, 0) - coalesce(r.qty, 0) - coalesce(o.qty, 0),
+         coalesce(inc.qty, 0),
+         coalesce(sa.n7, 0), coalesce(sa.n30, 0), coalesce(sa.n60, 0), coalesce(sa.n90, 0), sa.last_sale_at,
+         coalesce(vc.cost_price, 0), coalesce(v.price, p.base_price),
+         greatest(ceil(extract(epoch from now() - greatest(v.created_at, l.created_at)) / 86400), 1)::integer
+    from pairs pr
+    join locs l on l.id = pr.loc
+    join public.product_variants v on v.id = pr.variant_id
+    join public.products p on p.id = v.product_id
+    left join public.location_stock s on s.location_id = l.id and s.variant_id = v.id
+    left join res r on r.location_id = l.id and r.variant_id = v.id
+    left join outg o on o.loc = l.id and o.variant_id = v.id
+    left join incoming inc on inc.loc = l.id and inc.variant_id = v.id
+    left join sales sa on sa.location_id = l.id and sa.variant_id = v.id
+    left join public.variant_costs vc on vc.variant_id = v.id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- نقطة البيع: المتاح في فرع الكاشير (بدون تكلفة) — يُستخدم فقط عند تعدد المواقع
+-- ---------------------------------------------------------------------
+create or replace function public.pos_location_context()
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_loc uuid;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if not public._multi_location() then
+    return jsonb_build_object('multi', false);
+  end if;
+  v_loc := public._my_location();
+  return jsonb_build_object(
+    'multi', true,
+    'location_id', v_loc,
+    'location_name', (select name from public.locations where id = v_loc),
+    'stock', coalesce((select jsonb_object_agg(s.variant_id, s.qty) from public.location_stock s
+                        where s.location_id = v_loc and s.qty <> 0), '{}'::jsonb)
+  );
+end;
+$$;
+
+-- أين يتوفر الصنف؟ (لرسالة «غير متوفر في هذا الفرع — متوفر X في فرع Y»)
+create or replace function public.variant_locations(p_variant uuid)
+returns table (location_id uuid, location_name text, kind public.location_kind, on_hand integer, available integer)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+    select l.id, l.name, l.kind, s.qty,
+           s.qty - public._outgoing_pending(l.id, p_variant)
+             - coalesce((select r.qty from public._reserved_map() r where r.location_id = l.id and r.variant_id = p_variant), 0)
+      from public.location_stock s join public.locations l on l.id = s.location_id
+     where s.variant_id = p_variant and l.is_active and l.kind in ('store', 'warehouse') and s.qty > 0
+     order by s.qty desc;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- المقاسات والألوان الناقصة داخل كل موديل
+--   out_of_stock : مقاس/لون موجود في الموديل لكنه نفد في الفرع بينما الموديل يُباع فيه
+--   not_created  : المقاس واللون موجودان في الموديل لكن هذا التركيب غير مُنشأ أصلاً
+--   الأولوية = الطلب المتوقع (مبيعات 90 يوماً للصنف، أو متوسط أصناف الموديل إن لم يوجد)
+-- ---------------------------------------------------------------------
+create or replace function public.size_color_gaps(p_location uuid default null)
+returns table (
+  location_id uuid, location_name text, product_id uuid, product_name text, size text, color text,
+  variant_id uuid, gap_kind text, variant_sold_90 integer, model_sold_90 integer, model_sizes_in_stock integer,
+  available_elsewhere integer, priority numeric, reason text
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with av as (select * from public.location_availability(p_location) a where a.location_kind = 'store'),
+  model as (
+    select a.location_id, a.product_id, sum(a.n90)::integer as sold90,
+           count(*) filter (where a.available > 0)::integer as in_stock,
+           count(*)::integer as variants
+      from av a group by 1, 2
+  ),
+  elsewhere as (
+    select s.variant_id, s.location_id, (
+             select coalesce(sum(o.qty), 0) from public.location_stock o join public.locations l on l.id = o.location_id
+              where o.variant_id = s.variant_id and o.location_id <> s.location_id and l.is_active
+                and l.kind in ('store', 'warehouse') and o.qty > 0)::integer as qty
+      from av s
+  ),
+  oos as (
+    select a.location_id, a.location_name, a.product_id, a.product_name, a.size, a.color, a.variant_id,
+           'out_of_stock'::text as kind, a.n90 as vsold, m.sold90, m.in_stock, e.qty as other,
+           (greatest(a.n90, round(m.sold90::numeric / greatest(m.variants, 1), 2)))::numeric as prio
+      from av a
+      join model m on m.location_id = a.location_id and m.product_id = a.product_id
+      join elsewhere e on e.variant_id = a.variant_id and e.location_id = a.location_id
+     where a.available <= 0 and m.sold90 > 0 and m.variants >= 2
+  ),
+  dims as (
+    select distinct a.location_id, a.location_name, a.product_id, a.product_name, a.size, a.color
+      from av a where a.size is not null and a.color is not null
+  ),
+  missing as (
+    select s.location_id, s.location_name, s.product_id, s.product_name, s.size, c.color,
+           null::uuid as variant_id, 'not_created'::text as kind, 0 as vsold, m.sold90, m.in_stock, 0 as other,
+           round(m.sold90::numeric / greatest(m.variants, 1), 2) as prio
+      from (select distinct location_id, location_name, product_id, product_name, size from dims) s
+      join (select distinct location_id, product_id, color from dims) c
+        on c.location_id = s.location_id and c.product_id = s.product_id
+      join model m on m.location_id = s.location_id and m.product_id = s.product_id
+     where m.sold90 > 0
+       and not exists (select 1 from public.product_variants v
+                        where v.product_id = s.product_id and v.size = s.size and v.color = c.color)
+  ),
+  allg as (select * from oos union all select * from missing)
+  select g.location_id, g.location_name, g.product_id, g.product_name, g.size, g.color, g.variant_id, g.kind,
+         g.vsold, g.sold90, g.in_stock, g.other, g.prio,
+         case g.kind
+           when 'out_of_stock' then format(
+             'الموديل باع %s قطعة خلال 90 يوماً في %s، وهذا المقاس/اللون نفد (باع هو %s). متوفر %s في مواقع أخرى%s',
+             g.sold90, g.location_name, g.vsold, g.other,
+             case when g.other > 0 then ' ← انقل قبل أن تشتري' else ' ← يحتاج شراء' end)
+           else format(
+             'المقاس %s واللون %s موجودان في الموديل الذي باع %s قطعة خلال 90 يوماً، لكن هذا التركيب غير مُنشأ',
+             g.size, g.color, g.sold90)
+         end
+    from allg g
+   order by g.prio desc, g.product_name, g.size, g.color;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- المخزون الشاذ — كل تنبيه بسببه وأرقامه
+-- ---------------------------------------------------------------------
+create or replace function public.inventory_anomalies()
+returns table (
+  kind text, severity text, location_id uuid, location_name text, variant_id uuid, sku text,
+  product_name text, variant_label text, qty integer, value numeric, reason text, ref_id uuid
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with vv as (
+    select v.id, v.sku, v.barcode, v.stock_qty, v.is_active, p.name as pname,
+           nullif(concat_ws(' / ', v.size, v.color), '') as label,
+           coalesce(vc.cost_price, 0) as cost, coalesce(v.price, p.base_price) as price
+      from public.product_variants v join public.products p on p.id = v.product_id
+      left join public.variant_costs vc on vc.variant_id = v.id
+  )
+  -- مخزون سالب في موقع
+  select 'negative_stock'::text, 'high'::text, s.location_id, l.name, vv.id, vv.sku, vv.pname, vv.label, s.qty,
+         round(s.qty * vv.cost, 2),
+         format('رصيد %s في %s سالب (%s): بيع أو تسوية أكثر من الموجود — راجع آخر الحركات أو اعمل جرداً', vv.sku, l.name, s.qty),
+         null::uuid
+    from public.location_stock s join public.locations l on l.id = s.location_id join vv on vv.id = s.variant_id
+   where s.qty < 0
+  union all
+  -- كسر القيد (يجب ألا يحدث)
+  select 'invariant', 'high', null, null, vv.id, vv.sku, vv.pname, vv.label, vv.stock_qty, null,
+         format('إجمالي الصنف %s ومجموع مواقعه %s غير متطابقين', vv.stock_qty,
+                (select coalesce(sum(q.qty), 0) from public.location_stock q where q.variant_id = vv.id)),
+         null
+    from vv where vv.stock_qty <> (select coalesce(sum(q.qty), 0) from public.location_stock q where q.variant_id = vv.id)
+  union all
+  -- فروقات تحويل معلقة
+  select 'transfer_discrepancy', 'high', t.to_location, l.name, vv.id, vv.sku, vv.pname, vv.label,
+         i.qty_shipped - i.qty_received - i.qty_lost,
+         round((i.qty_shipped - i.qty_received - i.qty_lost) * vv.cost, 2),
+         format('التحويل %s: شُحن %s واستُلم %s — %s قطعة معلقة في الطريق بانتظار اعتماد الفقد أو وصولها',
+                t.transfer_no, i.qty_shipped, i.qty_received + i.qty_lost, i.qty_shipped - i.qty_received - i.qty_lost),
+         t.id
+    from public.transfer_items i join public.transfers t on t.id = i.transfer_id
+    join public.locations l on l.id = t.to_location join vv on vv.id = i.variant_id
+   where t.status = 'short_received' and i.qty_shipped - i.qty_received - i.qty_lost > 0
+  union all
+  -- تحويل في الطريق منذ أكثر من 7 أيام
+  select 'stale_transit', 'medium', t.to_location, l.name, null, null, null, null,
+         (select sum(i.qty_shipped - i.qty_received - i.qty_lost) from public.transfer_items i where i.transfer_id = t.id)::integer,
+         null,
+         format('التحويل %s في الطريق منذ %s يوماً دون استلام كامل',
+                t.transfer_no,
+                ((now() at time zone 'Asia/Riyadh')::date
+                 - ((select min(e.created_at) from public.transfer_events e where e.transfer_id = t.id and e.event = 'ship')
+                    at time zone 'Asia/Riyadh')::date)),
+         t.id
+    from public.transfers t join public.locations l on l.id = t.to_location
+   where t.status = 'in_transit'
+     and (select min(e.created_at) from public.transfer_events e where e.transfer_id = t.id and e.event = 'ship') < now() - interval '7 days'
+  union all
+  -- فروقات جرد كبيرة (آخر 90 يوماً)
+  select 'count_variance', 'medium', m.location_id, l.name, vv.id, vv.sku, vv.pname, vv.label, m.qty_change,
+         round(m.qty_change * vv.cost, 2),
+         format('جرد %s عدّل الرصيد بمقدار %s قطعة (قيمتها %s ر.س بالتكلفة)', coalesce(m.note, ''), m.qty_change,
+                round(abs(m.qty_change) * vv.cost, 2)),
+         m.ref_id
+    from public.location_movements m join public.locations l on l.id = m.location_id join vv on vv.id = m.variant_id
+   where m.type = 'count' and m.created_at >= now() - interval '90 days'
+     and (abs(m.qty_change) >= 3 or abs(m.qty_change) * vv.cost >= 200)
+  union all
+  -- تسويات يدوية كبيرة (آخر 30 يوماً)
+  select 'large_adjustment', 'medium', m.location_id, l.name, vv.id, vv.sku, vv.pname, vv.label, m.qty_change,
+         round(m.qty_change * vv.cost, 2),
+         format('تسوية يدوية بمقدار %s قطعة: %s', m.qty_change, coalesce(m.note, 'بدون سبب')),
+         null
+    from public.location_movements m join public.locations l on l.id = m.location_id join vv on vv.id = m.variant_id
+   where m.type = 'adjustment' and m.created_at >= now() - interval '30 days' and abs(m.qty_change) >= 5
+  union all
+  -- حركة بيع غير طبيعية: مبيعات 7 أيام أكثر من 3 أضعاف المعتاد (ومن 5 قطع فأكثر)
+  select 'sales_spike', 'low', a.location_id, l.name, vv.id, vv.sku, vv.pname, vv.label, a.n7, null,
+         format('باع %s خلال 7 أيام مقابل متوسط %s أسبوعياً في آخر 90 يوماً — تأكد من صحة البيع أو ارفع الطلب',
+                a.n7, round(a.n90 / 90.0 * 7, 1)),
+         null
+    from public._location_sales() a join public.locations l on l.id = a.location_id join vv on vv.id = a.variant_id
+   where a.n7 >= 5 and a.n7 > 3 * (a.n90 / 90.0 * 7)
+  union all
+  -- مخزون بلا تكلفة
+  select 'missing_cost', 'medium', null, null, vv.id, vv.sku, vv.pname, vv.label, vv.stock_qty,
+         round(vv.stock_qty * vv.price, 2),
+         format('%s قطعة بلا تكلفة مسجلة (قيمتها بالبيع %s ر.س) — الأرباح وقيمة المخزون غير دقيقة',
+                vv.stock_qty, round(vv.stock_qty * vv.price, 2)),
+         null
+    from vv where vv.stock_qty > 0 and vv.cost = 0
+  union all
+  -- مخزون بلا باركود
+  select 'missing_barcode', 'low', null, null, vv.id, vv.sku, vv.pname, vv.label, vv.stock_qty, null,
+         format('%s قطعة بلا باركود — المسح في البيع والجرد غير ممكن، ولّد باركوداً من صفحة المنتج', vv.stock_qty),
+         null
+    from vv where vv.stock_qty > 0 and vv.is_active and vv.barcode is null;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- خطة تصريف الراكد (اقتراح فقط — لا خصومات تلقائية)
+--   الأيام بلا بيع في الموقع (أو منذ وصول الصنف للموقع إن لم يُبع فيه)
+--   نقل: موقع آخر باع منه في آخر 30 يوماً | عرض: 90–179 يوماً | تخفيض: 180+ | لا إجراء: 30–89 (متابعة)
+-- ---------------------------------------------------------------------
+create or replace function public.dead_stock_plan(p_location uuid default null)
+returns table (
+  location_id uuid, location_name text, variant_id uuid, sku text, product_name text, variant_label text,
+  on_hand integer, idle_days integer, bucket integer, last_sale_at timestamptz,
+  best_location_id uuid, best_location_name text, best_location_sold_30 integer,
+  action text, suggested_qty integer, cost_value numeric, retail_value numeric, reason text
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with av as (select * from public.location_availability(p_location) a where a.on_hand > 0),
+  allsales as (select * from public._location_sales()),
+  arrival as (
+    select m.location_id, m.variant_id, min(m.created_at) as first_in
+      from public.location_movements m where m.qty_change > 0 group by 1, 2
+  ),
+  x as (
+    select a.*,
+           greatest(floor(extract(epoch from now() - coalesce(a.last_sale_at, ar.first_in, now())) / 86400), 0)::integer as idle,
+           b.location_id as best_loc, bl.name as best_name, coalesce(b.n30, 0) as best30
+      from av a
+      left join arrival ar on ar.location_id = a.location_id and ar.variant_id = a.variant_id
+      left join lateral (
+        select s.location_id, s.n30 from allsales s join public.locations l2 on l2.id = s.location_id
+         where s.variant_id = a.variant_id and s.location_id <> a.location_id and l2.is_active and l2.kind = 'store'
+           and s.n30 >= 2
+         order by s.n30 desc limit 1) b on true
+      left join public.locations bl on bl.id = b.location_id
+  )
+  select x.location_id, x.location_name, x.variant_id, x.sku, x.product_name,
+         nullif(concat_ws(' / ', x.size, x.color), ''), x.on_hand, x.idle,
+         case when x.idle >= 180 then 180 when x.idle >= 90 then 90 when x.idle >= 60 then 60 else 30 end,
+         x.last_sale_at, x.best_loc, x.best_name, x.best30,
+         case when x.best_loc is not null then 'transfer'
+              when x.idle >= 180 then 'markdown'
+              when x.idle >= 90 then 'promo'
+              else 'none' end,
+         case when x.best_loc is not null then least(x.available, x.best30) else x.on_hand end,
+         round(x.on_hand * x.unit_cost, 2), round(x.on_hand * x.unit_price, 2),
+         case when x.best_loc is not null then format(
+                'لم يُبع في %s منذ %s يوماً (لديه %s)، بينما باع %s منه %s قطعة خلال 30 يوماً ← انقل %s',
+                x.location_name, x.idle, x.on_hand, x.best_name, x.best30, least(x.available, x.best30))
+              when x.idle >= 180 then format('لم يُبع منذ %s يوماً (%s قطعة، %s ر.س بالتكلفة) ولا يُطلب في موقع آخر ← اقترح تخفيضاً',
+                x.idle, x.on_hand, round(x.on_hand * x.unit_cost, 2))
+              when x.idle >= 90 then format('لم يُبع منذ %s يوماً ولا يُطلب في موقع آخر ← اقترح عرضاً (مثل 2+1) أو إبرازه في الواجهة', x.idle)
+              else format('لم يُبع منذ %s يوماً — متابعة فقط', x.idle) end
+    from x
+   where x.idle >= 30
+   order by x.on_hand * x.unit_cost desc;
+end;
+$$;
+
+revoke all on function public._reserved_map(), public._location_sales() from public, anon, authenticated;
+revoke execute on function
+  public.location_availability(uuid), public.pos_location_context(), public.variant_locations(uuid),
+  public.size_color_gaps(uuid), public.inventory_anomalies(), public.dead_stock_plan(uuid)
+from public, anon;
+grant execute on function
+  public.location_availability(uuid), public.pos_location_context(), public.variant_locations(uuid),
+  public.size_color_gaps(uuid), public.inventory_anomalies(), public.dead_stock_plan(uuid)
+to authenticated;
+
+-- =====================================================================
+-- 0016_decision_center.sql
+-- =====================================================================
+-- =====================================================================
+-- Smart Inventory 2.0 — (4) مركز قرارات المالك
+--   توصيات: اطلب (شراء) / انقل / خفّض / اعرض / راجع — لكل منها الكمية والقيمة بالتكلفة والبيع و«لماذا؟» بالأرقام
+--   قاعدة: النقل الداخلي قبل الشراء. احتياج كل فرع يُغطّى أولاً من فائض المواقع الأخرى (الأبطأ بيعاً أولاً)،
+--   ولا يُقترح شراء إلا المتبقي بعد النقل
+--   الحسابات (مثل مساعد الشراء): متوسط يومي = 20% × 7 أيام + 50% × 30 + 30% × 90 (مطبّع بعمر الصنف في الموقع)
+--     نقطة الطلب = المتوسط × (التوريد + الأمان) | المستهدف = المتوسط × (التوريد + الأمان + التغطية)
+--     احتياج الفرع = المستهدف − (المتاح + القادم إليه) إذا نزل تحت نقطة الطلب
+--     فائض الموقع  = المتاح − مستهدفه (أو كل المتاح إن لم يكن يبيع، ما لم يصله الصنف خلال 30 يوماً)
+-- =====================================================================
+
+create or replace function public.decision_center(
+  p_lead_days integer default 7, p_cover_days integer default 30, p_safety_days integer default 7
+)
+returns table (
+  action text, priority integer, variant_id uuid, sku text, product_name text, variant_label text,
+  from_location uuid, from_name text, to_location uuid, to_name text, qty integer,
+  unit_cost numeric, unit_price numeric, cost_value numeric, retail_value numeric, reason text, why jsonb
+)
+language plpgsql volatile security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  r record;
+  d record;
+  v_remaining integer;
+  v_moved integer;
+  v_t integer;
+  v_parts text[];
+  v_elsewhere integer;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_lead_days < 0 or p_cover_days < 1 or p_safety_days < 0 then
+    raise exception 'قيم غير صحيحة';
+  end if;
+
+  drop table if exists pg_temp._dc;
+  drop table if exists pg_temp._dc_out;
+
+  create temp table _dc on commit drop as
+  select a.*,
+         nullif(concat_ws(' / ', a.size, a.color), '') as label,
+         case when a.location_kind = 'store' then round(
+             0.2 * a.n7 / least(7, a.age_days)::numeric
+           + 0.5 * a.n30 / least(30, a.age_days)::numeric
+           + 0.3 * a.n90 / least(90, a.age_days)::numeric, 3) else 0 end as avg_d,
+         (select min(m.created_at) from public.location_movements m
+           where m.location_id = a.location_id and m.variant_id = a.variant_id and m.qty_change > 0) as first_in
+    from public.location_availability(null) a;
+
+  alter table _dc add column target integer, add column rop integer, add column need integer,
+                  add column surplus integer, add column rem_surplus integer;
+  update _dc set target = ceil(avg_d * (p_lead_days + p_safety_days + p_cover_days))::integer,
+                 rop = ceil(avg_d * (p_lead_days + p_safety_days))::integer;
+  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit <= rop
+                             then greatest(target - (available + in_transit), 0) else 0 end;
+  update _dc set surplus = case
+                   when need > 0 then 0
+                   when avg_d > 0 then greatest(available - target, 0)
+                   -- صنف لا يُباع هنا: فائض كامل، إلا إن وصل حديثاً (أقل من 30 يوماً) — نمنحه فرصة
+                   when location_kind = 'store' and first_in > now() - interval '30 days' then 0
+                   else greatest(available, 0) end;
+  update _dc set rem_surplus = surplus;
+
+  create temp table _dc_out (
+    action text, priority integer, variant_id uuid, sku text, product_name text, variant_label text,
+    from_location uuid, from_name text, to_location uuid, to_name text, qty integer,
+    unit_cost numeric, unit_price numeric, reason text, why jsonb
+  ) on commit drop;
+
+  -- النقل ثم الشراء لكل احتياج
+  for r in select * from _dc where need > 0 order by avg_d desc, available asc loop
+    v_remaining := r.need;
+    v_moved := 0;
+    v_parts := '{}';
+    for d in
+      select * from _dc x
+       where x.variant_id = r.variant_id and x.location_id <> r.location_id and x.rem_surplus > 0
+       order by x.avg_d asc, x.rem_surplus desc
+    loop
+      exit when v_remaining = 0;
+      v_t := least(v_remaining, d.rem_surplus);
+      update _dc set rem_surplus = rem_surplus - v_t where location_id = d.location_id and variant_id = d.variant_id;
+      v_remaining := v_remaining - v_t;
+      v_moved := v_moved + v_t;
+      v_parts := v_parts || format('%s من «%s»', v_t, d.location_name);
+      insert into _dc_out values (
+        'transfer', case when r.available <= 0 then 1 else 2 end,
+        r.variant_id, r.sku, r.product_name, r.label,
+        d.location_id, d.location_name, r.location_id, r.location_name, v_t, r.unit_cost, r.unit_price,
+        format('«%s» لديه %s قطعة (المتاح %s) وباع %s خلال 30 يوماً و%s خلال 60 يوماً، ومستهدفه %s ← فائض %s. '
+               '«%s» لديه %s قطعة وباع %s خلال 30 يوماً (%s قطعة/يوم)، نقطة الطلب %s والمستهدف %s ← يحتاج %s. '
+               'انقل %s قطعة من «%s» إلى «%s».',
+               d.location_name, d.on_hand, d.available, d.n30, d.n60, d.target, d.surplus,
+               r.location_name, r.on_hand, r.n30, r.avg_d, r.rop, r.target, r.need,
+               v_t, d.location_name, r.location_name),
+        jsonb_build_object(
+          'from', jsonb_build_object('name', d.location_name, 'on_hand', d.on_hand, 'available', d.available,
+                                     'sold_7', d.n7, 'sold_30', d.n30, 'sold_60', d.n60, 'sold_90', d.n90,
+                                     'avg_daily', d.avg_d, 'target', d.target, 'surplus', d.surplus),
+          'to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
+                                   'in_transit', r.in_transit, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
+                                   'sold_90', r.n90, 'avg_daily', r.avg_d, 'reorder_point', r.rop,
+                                   'target', r.target, 'need', r.need),
+          'qty', v_t));
+    end loop;
+
+    if v_remaining > 0 then
+      select coalesce(sum(x.available), 0) into v_elsewhere from _dc x
+       where x.variant_id = r.variant_id and x.location_id <> r.location_id and x.available > 0;
+      insert into _dc_out values (
+        'order', case when r.available <= 0 then 1 else 2 end,
+        r.variant_id, r.sku, r.product_name, r.label,
+        null, null, r.location_id, r.location_name, v_remaining, r.unit_cost, r.unit_price,
+        format('«%s» يبيع %s قطعة/يوم (باع %s خلال 30 يوماً)، والمتاح %s + القادم %s ≤ نقطة الطلب %s ← يحتاج %s. %s اشترِ %s.',
+               r.location_name, r.avg_d, r.n30, r.available, r.in_transit, r.rop, r.need,
+               case when v_moved > 0 then format('يُغطّى %s بالنقل (%s)، والمتبقي بلا فائض في المواقع الأخرى ←',
+                                                  v_moved, array_to_string(v_parts, '، '))
+                    when v_elsewhere > 0 then format('متوفر %s في مواقع أخرى لكنها تحتاجه لمبيعاتها ←', v_elsewhere)
+                    else 'لا يوجد في أي موقع آخر ←' end,
+               v_remaining),
+        jsonb_build_object('to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
+                                                    'in_transit', r.in_transit, 'sold_30', r.n30, 'sold_90', r.n90,
+                                                    'avg_daily', r.avg_d, 'reorder_point', r.rop, 'target', r.target,
+                                                    'need', r.need),
+                           'covered_by_transfer', v_moved, 'available_elsewhere', v_elsewhere, 'qty', v_remaining));
+    end if;
+  end loop;
+
+  -- الراكد غير المخصص للنقل: عرض أو تخفيض (اقتراح فقط)
+  insert into _dc_out
+  select case when p.idle_days >= 180 then 'markdown' else 'promo' end,
+         case when p.idle_days >= 180 then 3 else 4 end,
+         p.variant_id, p.sku, p.product_name, p.variant_label, p.location_id, p.location_name, null, null,
+         p.on_hand, x.unit_cost, x.unit_price,
+         case when p.idle_days >= 180
+           then format('«%s»: %s قطعة لم تُبع منذ %s يوماً (قيمتها %s ر.س بالتكلفة) ولا يحتاجها موقع آخر ← اقترح تخفيضاً. لا يُطبَّق أي خصم تلقائياً.',
+                       p.location_name, p.on_hand, p.idle_days, p.cost_value)
+           else format('«%s»: %s قطعة لم تُبع منذ %s يوماً ولا يحتاجها موقع آخر ← اقترح عرضاً (مثل 2+1) أو إبرازها في الواجهة.',
+                       p.location_name, p.on_hand, p.idle_days) end,
+         jsonb_build_object('on_hand', p.on_hand, 'idle_days', p.idle_days, 'last_sale_at', p.last_sale_at,
+                            'cost_value', p.cost_value, 'retail_value', p.retail_value)
+    from public.dead_stock_plan(null) p
+    join _dc x on x.location_id = p.location_id and x.variant_id = p.variant_id
+   where p.idle_days >= 90
+     and not exists (select 1 from _dc_out o where o.action = 'transfer'
+                      and o.from_location = p.location_id and o.variant_id = p.variant_id);
+
+  -- ما يحتاج مراجعة
+  insert into _dc_out
+  select 'review', case when a.severity = 'high' then 1 else 3 end,
+         a.variant_id, a.sku, a.product_name, a.variant_label, a.location_id, a.location_name, null, null,
+         a.qty, null, null, a.reason, jsonb_build_object('kind', a.kind, 'severity', a.severity, 'ref_id', a.ref_id)
+    from public.inventory_anomalies() a
+   where a.severity in ('high', 'medium');
+
+  return query
+    select o.action, o.priority, o.variant_id, o.sku, o.product_name, o.variant_label,
+           o.from_location, o.from_name, o.to_location, o.to_name, o.qty, o.unit_cost, o.unit_price,
+           round(o.qty * o.unit_cost, 2), round(o.qty * o.unit_price, 2), o.reason, o.why
+      from _dc_out o
+     order by o.priority, case o.action when 'transfer' then 1 when 'order' then 2 when 'review' then 3
+                                        when 'markdown' then 4 else 5 end,
+              round(o.qty * coalesce(o.unit_cost, 0), 2) desc nulls last;
+end;
+$$;
+
+-- تنفيذ توصيات النقل: طلب تحويل لكل (مصدر، وجهة) — ويُعتمد مباشرة ما لم يكن فصل المهام مفعلاً
+-- p_lines: [{"from": uuid, "to": uuid, "variant_id": uuid, "qty": int}]
+create or replace function public.create_transfers_from_decisions(
+  p_lines jsonb, p_notes text default null, p_client_ref uuid default null, p_approve boolean default true
+) returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  g record;
+  v_id uuid;
+  v_out jsonb := '[]'::jsonb;
+  v_seg boolean := (select inventory_segregation from public.store_settings where id = 1);
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'لم يتم اختيار توصيات';
+  end if;
+  for g in
+    select (e ->> 'from')::uuid as f, (e ->> 'to')::uuid as t,
+           jsonb_agg(jsonb_build_object('variant_id', e ->> 'variant_id', 'qty', (e ->> 'qty')::integer)) as items
+      from jsonb_array_elements(p_lines) e group by 1, 2 order by 1, 2
+  loop
+    -- مفتاح مشتق لكل مجموعة: إعادة الإرسال لا تُنشئ تحويلاً مكرراً
+    v_id := public.request_transfer(g.f, g.t, g.items, coalesce(p_notes, 'من مركز القرارات'),
+              case when p_client_ref is null then null
+                   else md5(p_client_ref::text || g.f::text || g.t::text)::uuid end);
+    if p_approve and not v_seg and (select status from public.transfers where id = v_id) = 'requested' then
+      perform public.approve_transfer(v_id, null, 'اعتماد من مركز القرارات');
+    end if;
+    v_out := v_out || jsonb_build_object('id', v_id, 'transfer_no', (select transfer_no from public.transfers where id = v_id),
+                                         'status', (select status from public.transfers where id = v_id));
+  end loop;
+  return v_out;
+end;
+$$;
+
+-- تنفيذ توصيات الشراء: مسودة لمورد مع موقع الاستلام (يعيد استخدام create_purchase_draft)
+create or replace function public.create_purchase_draft_at(
+  p_supplier_id uuid, p_location uuid, p_items jsonb, p_notes text default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  v_id := public.create_purchase_draft(p_supplier_id, p_items, coalesce(p_notes, 'مسودة من مركز القرارات'));
+  update public.purchase_orders set location_id = p_location where id = v_id;
+  return v_id;
+end;
+$$;
+
+revoke execute on function
+  public.decision_center(integer, integer, integer),
+  public.create_transfers_from_decisions(jsonb, text, uuid, boolean),
+  public.create_purchase_draft_at(uuid, uuid, jsonb, text)
+from public, anon;
+grant execute on function
+  public.decision_center(integer, integer, integer),
+  public.create_transfers_from_decisions(jsonb, text, uuid, boolean),
+  public.create_purchase_draft_at(uuid, uuid, jsonb, text)
+to authenticated;
 
 commit;
