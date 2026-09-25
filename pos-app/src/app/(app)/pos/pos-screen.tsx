@@ -4,6 +4,7 @@ import {
   Banknote,
   CreditCard,
   Landmark,
+  MapPin,
   Minus,
   PauseCircle,
   PlayCircle,
@@ -21,6 +22,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReceiptModal } from "@/components/receipt-modal";
 import { CameraScanButton, CameraScanner, type ScanOutcome } from "@/components/camera-scanner";
+import { NewTransferModal } from "@/components/new-transfer-modal";
 import { OpenShiftModal, fetchMyOpenShift } from "@/components/shift-dialogs";
 import type { ReceiptData } from "@/components/receipt";
 import { useSession } from "@/components/session-context";
@@ -28,6 +30,7 @@ import { Badge, Button, Field, Input, Modal, cn, useToast } from "@/components/u
 import { fetchCatalog, fetchCategories, normalize } from "@/lib/catalog";
 import { PAYMENT_LABELS, errorMessage, money, round2, variantLabel } from "@/lib/format";
 import { balanceSplit, computeTotals } from "@/lib/pricing";
+import { fetchLocations, type Location, type PosLocationContext, type VariantLocation } from "@/lib/inventory";
 import { loadReceipt } from "@/lib/sales";
 import { supabase } from "@/lib/supabase/client";
 import type { CatalogItem, Category, Customer, OpenShift, PaymentMethod, ReturnRecord } from "@/lib/types";
@@ -97,6 +100,9 @@ export function PosScreen() {
   const [shift, setShift] = useState<OpenShift | null | undefined>(undefined);
   const [showOpenShift, setShowOpenShift] = useState(false);
   const [showCamera, setShowCamera] = useState(false);
+  // تعدد المواقع: الرصيد المعروض والمسموح بيعه هو رصيد فرع الوردية فقط
+  const [branch, setBranch] = useState<{ id: string; name: string } | null>(null);
+  const [unavail, setUnavail] = useState<CatalogItem | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const focusSearch = useCallback(() => {
@@ -106,8 +112,16 @@ export function PosScreen() {
   const loadCatalog = useCallback(async () => {
     setLoading(true);
     try {
-      const [items, cats] = await Promise.all([fetchCatalog(), fetchCategories()]);
-      setCatalog(items);
+      const [items, cats, ctxRes] = await Promise.all([fetchCatalog(), fetchCategories(), supabase().rpc("pos_location_context")]);
+      const ctx = (ctxRes.error ? null : ctxRes.data) as PosLocationContext | null;
+      if (ctx?.multi && ctx.location_id) {
+        const local = ctx.stock ?? {};
+        setBranch({ id: ctx.location_id, name: ctx.location_name ?? "" });
+        setCatalog(items.map((i) => ({ ...i, stock_qty: Number(local[i.variant_id] ?? 0) })));
+      } else {
+        setBranch(null);
+        setCatalog(items);
+      }
       setCategories(cats);
     } catch (e) {
       toast(errorMessage(e), "error");
@@ -193,7 +207,8 @@ export function PosScreen() {
         const existing = prev.find((l) => l.item.variant_id === item.variant_id);
         const inCart = existing?.qty ?? 0;
         if (!settings.allow_negative_stock && inCart + qty > item.stock_qty) {
-          toast(`الكمية المتوفرة من ${item.product_name} (${variantLabel(item.size, item.color)}) هي ${item.stock_qty} فقط`, "error");
+          if (branch) setUnavail(item);
+          else toast(`الكمية المتوفرة من ${item.product_name} (${variantLabel(item.size, item.color)}) هي ${item.stock_qty} فقط`, "error");
           return prev;
         }
         if (existing) {
@@ -202,7 +217,7 @@ export function PosScreen() {
         return [...prev, { item, qty, discount: 0 }];
       });
     },
-    [settings.allow_negative_stock, toast],
+    [settings.allow_negative_stock, toast, branch],
   );
 
   const setQty = (variantId: string, qty: number) => {
@@ -211,7 +226,8 @@ export function PosScreen() {
         if (l.item.variant_id !== variantId) return [l];
         if (qty <= 0) return [];
         if (!settings.allow_negative_stock && qty > l.item.stock_qty) {
-          toast(`المتوفر ${l.item.stock_qty} فقط`, "error");
+          if (branch) setUnavail(l.item);
+          else toast(`المتوفر ${l.item.stock_qty} فقط`, "error");
           return [l];
         }
         return [{ ...l, qty, discount: Math.min(l.discount, round2(l.item.price * qty)) }];
@@ -282,7 +298,12 @@ export function PosScreen() {
     if (!item) return { ok: false, message: `لا يوجد صنف بالرمز ${code}` };
     const inCart = cartRef.current.find((l) => l.item.variant_id === item.variant_id)?.qty ?? 0;
     if (!settings.allow_negative_stock && inCart + 1 > item.stock_qty) {
-      return { ok: false, message: `${item.product_name}: المتوفر ${item.stock_qty} فقط` };
+      return {
+        ok: false,
+        message: branch
+          ? `${item.product_name}: غير متوفر في هذا الفرع (${item.stock_qty} فقط) — اضغط على الصنف لمعرفة الفروع الأخرى`
+          : `${item.product_name}: المتوفر ${item.stock_qty} فقط`,
+      };
     }
     addToCart(item);
     // تحديث فوري حتى تُحسب المسحة التالية لنفس الصنف بشكل صحيح
@@ -576,6 +597,11 @@ export function PosScreen() {
               />
             </div>
             <CameraScanButton onClick={() => setShowCamera(true)} />
+            {branch && (
+              <span className="hidden items-center gap-1 whitespace-nowrap rounded-lg bg-sky-50 px-2 text-xs font-medium text-sky-800 md:inline-flex" title="المخزون المعروض هو رصيد هذا الفرع">
+                <MapPin className="size-3.5" /> {branch.name}
+              </span>
+            )}
             <Button variant="outline" size="lg" onClick={loadCatalog} title="تحديث" aria-label="تحديث">
               <RefreshCw className={cn("size-5", loading && "animate-spin")} />
             </Button>
@@ -682,8 +708,10 @@ export function PosScreen() {
           setPicker(null);
           focusSearch();
         }}
-        allowNegative={settings.allow_negative_stock}
+        // مع تعدد المواقع يبقى الصنف قابلاً للضغط لإظهار توفره في الفروع الأخرى
+        allowNegative={settings.allow_negative_stock || branch !== null}
       />
+      {unavail && branch && <UnavailableModal item={unavail} branch={branch} onClose={() => (setUnavail(null), focusSearch())} />}
 
       <CustomerPicker
         open={showCustomer}
@@ -1183,6 +1211,72 @@ function HeldCartsModal({
           ))}
         </ul>
       )}
+    </Modal>
+  );
+}
+
+/** «غير متوفر في هذا الفرع — متوفر X قطع في فرع Y» مع طلب تحويل (بدون أي تحويل تلقائي) */
+function UnavailableModal({ item, branch, onClose }: { item: CatalogItem; branch: { id: string; name: string }; onClose: () => void }) {
+  const toast = useToast();
+  const [others, setOthers] = useState<VariantLocation[] | null>(null);
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [transferFrom, setTransferFrom] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    supabase()
+      .rpc("variant_locations", { p_variant: item.variant_id })
+      .then(({ data }) => alive && setOthers(((data ?? []) as VariantLocation[]).filter((l) => l.location_id !== branch.id && l.available > 0)));
+    fetchLocations()
+      .then((l) => alive && setLocations(l))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [item.variant_id, branch.id]);
+
+  const label = variantLabel(item.size, item.color);
+  if (transferFrom !== null)
+    return (
+      <NewTransferModal
+        locations={locations}
+        defaultFrom={transferFrom}
+        defaultTo={branch.id}
+        initialLines={[{ variant_id: item.variant_id, name: item.product_name, label, sku: item.sku, qty: 1 }]}
+        onClose={onClose}
+        onCreated={() => {
+          toast("تم إرسال طلب التحويل — تابعه من «التحويلات»");
+          onClose();
+        }}
+      />
+    );
+
+  return (
+    <Modal open onClose={onClose} title="غير متوفر في هذا الفرع" size="sm">
+      <div className="space-y-3 text-sm">
+        <p>
+          <b>{item.product_name}</b> {label && <span className="text-slate-500">({label})</span>} — المتوفر في {branch.name}: <b>{Math.max(item.stock_qty, 0)}</b>
+        </p>
+        {others === null ? (
+          <p className="text-slate-500">جاري البحث في الفروع الأخرى…</p>
+        ) : others.length === 0 ? (
+          <p className="rounded-lg bg-slate-50 p-3 text-slate-600">غير متوفر في أي فرع أو مستودع آخر.</p>
+        ) : (
+          <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+            {others.map((o) => (
+              <li key={o.location_id} className="flex items-center justify-between gap-2 p-3">
+                <span>
+                  متوفر <b>{o.available}</b> قطع في <b>{o.location_name}</b>
+                </span>
+                <Button size="sm" onClick={() => setTransferFrom(o.location_id)} disabled={locations.length === 0}>
+                  طلب تحويل
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-slate-500">لا يمكن البيع من مخزون فرع آخر. اطلب التحويل وسيُضاف للفرع عند استلامه.</p>
+      </div>
     </Modal>
   );
 }

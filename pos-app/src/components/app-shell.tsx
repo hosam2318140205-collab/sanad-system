@@ -1,7 +1,11 @@
 "use client";
 
 import {
+  Activity,
+  ArrowLeftRight,
   BarChart3,
+  Compass,
+  MapPin,
   Boxes,
   ClipboardCheck,
   FileText,
@@ -52,12 +56,16 @@ const NAV: NavItem[] = [
   { href: "/products", label: "المنتجات", icon: Shirt, roles: M },
   { href: "/inventory", label: "المخزون", icon: Boxes, roles: M },
   { href: "/inventory/counts", label: "الجرد", icon: ClipboardCheck, roles: ALL },
+  { href: "/transfers", label: "التحويلات", icon: ArrowLeftRight, roles: ALL },
+  { href: "/decisions", label: "مركز قرارات المخزون", icon: Compass, roles: M },
+  { href: "/inventory/insights", label: "تحليلات المخزون", icon: Activity, roles: M },
   { href: "/purchases", label: "المشتريات", icon: PackagePlus, roles: M },
   { href: "/advisor", label: "مساعد الشراء الذكي", icon: Lightbulb, roles: M },
   { href: "/suppliers", label: "الموردون", icon: Truck, roles: M },
   { href: "/expenses", label: "المصروفات", icon: HandCoins, roles: M },
   { href: "/customers", label: "العملاء", icon: Users, roles: ALL },
   { href: "/reports", label: "التقارير", icon: BarChart3, roles: M },
+  { href: "/locations", label: "الفروع والمستودعات", icon: MapPin, roles: ["owner"] },
   { href: "/users", label: "المستخدمون", icon: UserCog, roles: ["owner"] },
   { href: "/audit", label: "سجل التدقيق", icon: ShieldCheck, roles: ["owner"] },
   { href: "/settings", label: "الإعدادات", icon: Settings, roles: ["owner"] },
