@@ -81,7 +81,7 @@ check "$(qty RB $V) = 7 and $(qty TRANSIT $V) = 0" "استُلمت 7 مرة وا
 echo "▶ بيع آخر قطعة من كاشيرين في نفس اللحظة"
 SALE="select public.complete_sale('[{\"variant_id\":\"$W\",\"qty\":1}]', '[{\"method\":\"cash\",\"amount\":50}]')"
 r=$(race $CASH1 "$SALE" $CASH2 "$SALE")
-[[ "$r" == *"غير متوفر"* || "$r" == *"المتوفر"* ]] || { echo "✗ second sale should fail: $r" >&2; exit 1; }
+[[ "$r" == *"غير متوفر"* || "$r" == *"المتوفر"* || "$r" == *"المتاح"* ]] || { echo "✗ second sale should fail: $r" >&2; exit 1; }
 check "$(qty RB $W) = 0 and (select stock_qty from public.product_variants where id = '$W') = 0" "بيعت مرة واحدة ولا رصيد سالب"
 
 echo "▶ نفس طلب التحويل بنفس المرجع من جلستين"
