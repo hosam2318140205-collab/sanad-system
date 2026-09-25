@@ -73,6 +73,7 @@ export function CashMovementModal({
   onDone: () => void;
 }) {
   const toast = useToast();
+  const { isManager } = useSession();
   const [amount, setAmount] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -114,6 +115,11 @@ export function CashMovementModal({
             placeholder={type === "in" ? "فكة من الإدارة" : "شراء أكياس / مصروف"}
           />
         </Field>
+        {type === "out" && isManager && (
+          <p className="rounded-lg bg-slate-50 p-2.5 text-xs text-slate-600">
+            لمصروف يُحتسب في صافي الربح (إيجار، كهرباء، مستلزمات) سجّله من صفحة «المصروفات» باختيار «من درج الوردية» — يُخصم من الدرج تلقائياً.
+          </p>
+        )}
       </div>
     </Modal>
   );

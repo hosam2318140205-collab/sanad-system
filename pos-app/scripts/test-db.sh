@@ -28,6 +28,9 @@ step supabase/tests/smoke_test.sql
 echo "▶ Shifts: open, link sales/returns, drawer math, blind close, permissions"
 step supabase/tests/shifts_test.sql
 
+echo "▶ Expenses: drawer link, locks, summary, permissions"
+step supabase/tests/expenses_test.sql
+
 echo "▶ Demo data: seed, remove, re-seed"
 step supabase/tests/demo_data_test.sql
 

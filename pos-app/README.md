@@ -18,6 +18,7 @@
 | **العملاء** | بحث بالجوال، إضافة سريعة من شاشة البيع، الرقم الضريبي للشركات، سجل المشتريات |
 | **التقارير** | المبيعات، المرتجعات، الصافي، ضريبة المخرجات، تكلفة البضاعة، مجمل الربح والهامش، حسب اليوم/طريقة الدفع/الكاشير/المنتج/التصنيف/المقاس، تصدير CSV لـ Excel |
 | **لوحة التحكم** | مبيعات وأرباح اليوم والشهر، الرسم اليومي، الأكثر مبيعاً، تنبيهات المخزون، آخر الفواتير |
+| **المصروفات** | تصنيفات، ضريبة مدخلات (زر 15%)، الدفع نقداً/شبكة/تحويل أو من درج الوردية (يُسجَّل سحباً تلقائياً)، صورة الإيصال في مخزن خاص، صافي الربح في التقارير ولوحة التحكم، تصدير CSV |
 | **مسح بالكاميرا** | الكاميرا الخلفية لأي جوال (iPhone وAndroid) تقرأ EAN-13/EAN-8/UPC/Code128/Code39: في نقطة البيع والجرد (مسح متتالي — القطعة تُحتسب مرة حتى تخرج من الإطار)، وفي أوامر الشراء، وفي تعديل المنتج لإدخال الباركود المطبوع على القطعة |
 | **الورديات** | فتح برصيد افتتاحي، ربط كل بيع/مرتجع بالوردية، إيداع/سحب نقدي بسبب، إغلاق بعدّ أعمى، مطابقة الدرج والعجز/الزيادة، تقرير Z مطبوع |
 | **الصلاحيات** | المالك / المدير / الكاشير — مطبّقة في قاعدة البيانات (RLS) وليس في الواجهة فقط |
@@ -67,20 +68,21 @@ supabase/
                              start/apply_stock_count, dashboard_stats, sales_report
     0005_storage_limits.sql  صور فقط، 5MB، داخل مجلد products/
     0006_shifts.sql          الورديات وإغلاق الصندوق (عدّ أعمى، مطابقة الدرج، تقرير Z)
+    0007_expenses.sql        المصروفات، الربط بدرج الوردية، إيصالات خاصة، ملخص صافي الربح
   setup/                     ما يُنفَّذ في SQL Editor على Production
     01_all_migrations.sql    كل الـ migrations في ملف واحد (مولَّد — لا يُعدَّل يدوياً)
     02_demo_data.sql         بيانات تجريبية معلَّمة (DEMO-) — اختياري
     03_remove_demo_data.sql  حذف البيانات التجريبية فقط
     04_reset_test_transactions.sql  تصفير فواتير التجربة قبل الافتتاح (يتطلب تأكيداً)
     upgrades/                ترقيات لمشروع قائم: ملف لكل migration جديدة (مولَّد)
-  tests/                     smoke_test.sql, shifts_test.sql, demo_data_test.sql, supabase_stub.sql
+  tests/                     smoke_test.sql, shifts_test.sql, expenses_test.sql, demo_data_test.sql, supabase_stub.sql
 scripts/                     bundle-migrations, check-bundle-secrets, test-db
 src/
   proxy.ts                   تحديث جلسة Supabase وحماية المسارات (Next 16 proxy)
   lib/                       عملاء Supabase، الأنواع، التنسيق، الضريبة، ZATCA QR، الباركود
   components/                واجهة المستخدم، الفاتورة الحرارية، ملصقات الباركود، الرسوم
   app/(app)/                 pos, sales, returns, products, inventory, purchases, suppliers,
-                             customers, reports, dashboard, shifts, users, settings, audit
+                             customers, reports, dashboard, shifts, expenses, users, settings, audit
 ```
 
 ### قرارات تصميم مهمة

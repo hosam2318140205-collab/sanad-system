@@ -8,7 +8,8 @@ import { useSession } from "@/components/session-context";
 import { Badge, Button, Card, Loading, PageHeader, Stat, Table, useToast } from "@/components/ui";
 import { PAYMENT_LABELS, SALE_STATUS_LABELS, dateTime, errorMessage, money, num, variantLabel } from "@/lib/format";
 import { supabase } from "@/lib/supabase/client";
-import type { PaymentMethod, SaleStatus } from "@/lib/types";
+import { presets } from "@/lib/periods";
+import type { ExpensesSummary, PaymentMethod, SaleStatus } from "@/lib/types";
 
 interface Stats {
   today: { sales: number; count: number; vat: number; returns: number; profit: number };
@@ -26,14 +27,21 @@ export function Dashboard() {
   const toast = useToast();
   const { profile } = useSession();
   const [stats, setStats] = useState<Stats | null>(null);
+  const [monthExpenses, setMonthExpenses] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await supabase().rpc("dashboard_stats");
+    const db = supabase();
+    const month = presets()[3];
+    const [{ data, error }, { data: exp, error: expErr }] = await Promise.all([
+      db.rpc("dashboard_stats"),
+      db.rpc("expenses_summary", { p_from: month.from, p_to: month.to }),
+    ]);
     setLoading(false);
     if (error) return toast(errorMessage(error), "error");
     setStats(data as Stats);
+    setMonthExpenses(expErr ? null : Number((exp as ExpensesSummary).net));
   }, [toast]);
 
   useEffect(() => {
@@ -70,7 +78,16 @@ export function Dashboard() {
       <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat label="مبيعات الشهر" value={money(m.sales)} hint={`${num(m.count)} فاتورة`} icon={<Receipt className="size-5" />} />
         <Stat label="صافي الشهر" value={money(m.sales - m.returns)} hint={`مرتجعات ${money(m.returns)}`} />
-        <Stat label="ربح الشهر" value={money(m.profit)} tone="green" />
+        {monthExpenses === null ? (
+          <Stat label="ربح الشهر" value={money(m.profit)} tone="green" />
+        ) : (
+          <Stat
+            label="صافي ربح الشهر"
+            value={money(Number(m.profit) - monthExpenses)}
+            hint={`مجمل ${money(m.profit)} − مصروفات ${money(monthExpenses)}`}
+            tone={Number(m.profit) - monthExpenses >= 0 ? "green" : "red"}
+          />
+        )}
         <Stat label="قيمة المخزون (تكلفة)" value={money(stats.stock_value.cost)} hint={`${num(stats.stock_value.units)} قطعة · بيع ${money(stats.stock_value.retail)}`} icon={<Boxes className="size-5" />} />
       </div>
 

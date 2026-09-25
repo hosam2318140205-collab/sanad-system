@@ -1,6 +1,6 @@
 -- =====================================================================
 -- ⚠️ تصفير عمليات التجربة قبل الافتتاح الفعلي — لا يمكن التراجع عنه
--- يحذف كل: الفواتير والمدفوعات والمرتجعات والورديات وأوامر الشراء والجرد وحركات المخزون،
+-- يحذف كل: الفواتير والمدفوعات والمرتجعات والورديات والمصروفات وأوامر الشراء والجرد وحركات المخزون،
 -- ويعيد ترقيم الفواتير لتبدأ من 1 (INV-..000001).
 -- يُبقي: المنتجات والمقاسات والأسعار والتكاليف والعملاء والموردين والمستخدمين والإعدادات
 -- وسجل التدقيق. الكميات الحالية تُسجَّل كرصيد افتتاحي — يُنصح بعمل جرد بعدها.
@@ -24,6 +24,7 @@ begin
   delete from public.stock_count_items;
   delete from public.stock_counts;
   delete from public.stock_movements;
+  delete from public.expenses;
   delete from public.shift_cash_movements;
   delete from public.shifts;
 
@@ -32,6 +33,7 @@ begin
   alter sequence public.purchase_seq restart with 1;
   alter sequence public.count_seq restart with 1;
   alter sequence public.shift_seq restart with 1;
+  alter sequence public.expense_seq restart with 1;
 
   insert into public.stock_movements (variant_id, type, qty_change, balance_after, note)
   select id, 'opening', stock_qty, stock_qty, 'رصيد افتتاحي بعد تصفير التجربة'

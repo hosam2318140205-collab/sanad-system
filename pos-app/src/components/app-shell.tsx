@@ -20,6 +20,7 @@ import {
   Users,
   PackagePlus,
   Wallet,
+  HandCoins,
   X,
 } from "lucide-react";
 import Link from "next/link";
@@ -52,6 +53,7 @@ const NAV: NavItem[] = [
   { href: "/inventory/counts", label: "الجرد", icon: ClipboardCheck, roles: ALL },
   { href: "/purchases", label: "المشتريات", icon: PackagePlus, roles: M },
   { href: "/suppliers", label: "الموردون", icon: Truck, roles: M },
+  { href: "/expenses", label: "المصروفات", icon: HandCoins, roles: M },
   { href: "/customers", label: "العملاء", icon: Users, roles: ALL },
   { href: "/reports", label: "التقارير", icon: BarChart3, roles: M },
   { href: "/users", label: "المستخدمون", icon: UserCog, roles: ["owner"] },
