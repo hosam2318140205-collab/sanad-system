@@ -2749,15 +2749,17 @@ begin
   if p_client_ref is null then
     return false;
   end if;
-  select * into v from public.inventory_ops where client_ref = p_client_ref;
-  if v.client_ref is not null then
-    if v.op <> p_op or v.created_by is distinct from auth.uid() then
-      raise exception 'مرجع العملية مستخدم مسبقاً';
-    end if;
-    return true;
+  -- الحجز بالإدراج: جلسة متزامنة بنفس المرجع تنتظر هنا ثم تعامَل كتكرار (لا خطأ تفرد ولا تنفيذ مزدوج)
+  insert into public.inventory_ops (client_ref, op, ref_id) values (p_client_ref, p_op, p_ref)
+  on conflict (client_ref) do nothing;
+  if found then
+    return false;
   end if;
-  insert into public.inventory_ops (client_ref, op, ref_id) values (p_client_ref, p_op, p_ref);
-  return false;
+  select * into v from public.inventory_ops where client_ref = p_client_ref;
+  if v.op <> p_op or v.created_by is distinct from auth.uid() then
+    raise exception 'مرجع العملية مستخدم مسبقاً';
+  end if;
+  return true;
 end;
 $$;
 
@@ -2915,6 +2917,8 @@ begin
     raise exception 'غير مصرح';
   end if;
   if p_client_ref is not null then
+    -- نفس الطلب من جلستين متزامنتين: الثانية تنتظر ثم تجد الطلب الأول
+    perform pg_advisory_xact_lock(hashtextextended('transfer:' || p_client_ref::text, 0));
     select * into v_existing from public.transfers where client_ref = p_client_ref;
     if v_existing.id is not null then
       if v_existing.requested_by is distinct from auth.uid() then
@@ -3308,6 +3312,8 @@ revoke all on function
   public._outgoing_pending(uuid, uuid, uuid), public._can_act_at(uuid), public._transfer_refresh(uuid, boolean),
   public.locations_guard()
 from public, anon, authenticated;
+-- تستخدمها سياسة transfers_select وتعيد موقع المستخدم نفسه فقط
+grant execute on function public._my_location() to authenticated;
 
 revoke execute on function
   public.adjust_location_stock(uuid, uuid, integer, text, uuid),
@@ -3414,12 +3420,14 @@ declare
   c public.stock_counts;
   v_variant record;
   v_item public.stock_count_items;
+  v_scan bigint;
   v_code text := trim(coalesce(p_code, ''));
 begin
   if not public.is_staff() then
     raise exception 'غير مصرح';
   end if;
-  select * into c from public.stock_counts where id = p_count_id;
+  -- قفل مشترك: المسحات المتزامنة تمر معاً، أما الإرسال/الاعتماد (FOR UPDATE) فينتظرها
+  select * into c from public.stock_counts where id = p_count_id for share;
   if c.id is null or c.status <> 'open' then
     raise exception 'الجرد غير مفتوح';
   end if;
@@ -3432,14 +3440,19 @@ begin
     raise exception 'لا يوجد صنف بالرمز %', v_code;
   end if;
 
-  -- نفس المسحة أُرسلت سابقاً (ضغط مزدوج/إعادة إرسال): لا تُحسب مرة ثانية
-  if p_client_ref is not null and exists (select 1 from public.stock_count_scans where client_ref = p_client_ref) then
+  if coalesce(p_qty, 0) = 0 then
+    raise exception 'كمية غير صحيحة';
+  end if;
+
+  -- المسحة تحجز مرجعها أولاً: نفس المسحة (ضغط مزدوج/إعادة إرسال، ولو من جلستين متزامنتين) لا تُحسب مرتين
+  insert into public.stock_count_scans (count_id, variant_id, qty, client_ref)
+  values (p_count_id, v_variant.id, p_qty, p_client_ref)
+  on conflict (client_ref) do nothing
+  returning id into v_scan;
+  if v_scan is null then
     select * into v_item from public.stock_count_items where count_id = p_count_id and variant_id = v_variant.id;
     return jsonb_build_object('variant_id', v_variant.id, 'sku', v_variant.sku, 'name', v_variant.name,
                               'label', v_variant.label, 'counted', v_item.counted_qty, 'duplicate', true);
-  end if;
-  if coalesce(p_qty, 0) = 0 then
-    raise exception 'كمية غير صحيحة';
   end if;
 
   insert into public.stock_count_items (count_id, variant_id, expected_qty)
@@ -3449,6 +3462,7 @@ begin
   on conflict (count_id, variant_id) do nothing;
 
   -- التحديث يقفل الصف: مسحات متزامنة لنفس الصنف تُجمع بالترتيب
+  perform set_config('app.count_rpc', 'on', true);
   update public.stock_count_items
      set counted_qty = coalesce(counted_qty, 0) + p_qty, counted_by = auth.uid(), counted_at = clock_timestamp()
    where count_id = p_count_id and variant_id = v_variant.id
@@ -3456,7 +3470,7 @@ begin
   if v_item.counted_qty < 0 then
     raise exception 'الكمية المعدودة لا تكون سالبة';
   end if;
-  insert into public.stock_count_scans (count_id, variant_id, qty, client_ref) values (p_count_id, v_variant.id, p_qty, p_client_ref);
+  perform set_config('app.count_rpc', '', true);
 
   return jsonb_build_object('variant_id', v_variant.id, 'sku', v_variant.sku, 'name', v_variant.name,
                             'label', v_variant.label, 'counted', v_item.counted_qty, 'duplicate', false);
@@ -3470,14 +3484,22 @@ language plpgsql security definer set search_path = public as $$
 declare
   v_current integer;
 begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if (select status from public.stock_counts where id = p_count_id) is distinct from 'open' then
+    raise exception 'الجرد غير مفتوح';
+  end if;
   if p_qty is null or p_qty < 0 then
     raise exception 'كمية غير صحيحة';
   end if;
   select coalesce(counted_qty, 0) into v_current from public.stock_count_items
    where count_id = p_count_id and variant_id = p_variant for update;
   if p_qty = coalesce(v_current, 0) then
+    perform set_config('app.count_rpc', 'on', true);
     update public.stock_count_items set counted_qty = p_qty, counted_by = auth.uid(), counted_at = clock_timestamp()
      where count_id = p_count_id and variant_id = p_variant and counted_qty is null;
+    perform set_config('app.count_rpc', '', true);
     return jsonb_build_object('counted', p_qty);
   end if;
   return public.record_count_scan(p_count_id, (select sku from public.product_variants where id = p_variant),
@@ -3650,9 +3672,24 @@ $$;
 create trigger stock_counts_guard_legacy_apply before update of status on public.stock_counts
   for each row execute function public.guard_legacy_apply();
 
--- جرد أعمى: الكمية النظامية لا تُقرأ مباشرة (المدير يراها عبر count_review)، والعدّ عبر الدوال فقط
-revoke select, update on public.stock_count_items from authenticated;
+-- جرد أعمى: الكمية النظامية لا تُقرأ مباشرة (المدير يراها عبر count_review)
+revoke select on public.stock_count_items from authenticated;
 grant select (id, count_id, variant_id, counted_qty, counted_by, counted_at) on public.stock_count_items to authenticated;
+
+-- جرد الموقع يُعدّ عبر المسحات فقط (سجل كامل ومنع التكرار). الجرد القديم (بلا موقع) يبقى كما كان
+create or replace function public.guard_count_item_update()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.counted_qty is distinct from old.counted_qty
+     and coalesce(current_setting('app.count_rpc', true), '') <> 'on'
+     and (select location_id from public.stock_counts where id = new.count_id) is not null then
+    raise exception 'جرد الموقع يُسجَّل بالمسح أو إدخال الكمية فقط';
+  end if;
+  return new;
+end;
+$$;
+create trigger stock_count_items_guard before update on public.stock_count_items
+  for each row execute function public.guard_count_item_update();
 
 alter table public.stock_count_scans enable row level security;
 revoke all on public.stock_count_scans from anon;
@@ -3661,7 +3698,7 @@ grant select on public.stock_count_scans to authenticated;
 create policy count_scans_select on public.stock_count_scans for select to authenticated using (public.is_staff());
 
 revoke all on function public._location_qty_at(uuid, uuid, timestamptz), public.guard_legacy_count(),
-  public.guard_legacy_apply() from public, anon, authenticated;
+  public.guard_legacy_apply(), public.guard_count_item_update() from public, anon, authenticated;
 revoke execute on function
   public.start_location_count(uuid, uuid, text),
   public.record_count_scan(uuid, text, integer, uuid),
@@ -3766,7 +3803,7 @@ returns table (
   location_id uuid, location_name text, location_kind public.location_kind,
   variant_id uuid, product_id uuid, product_name text, category_id uuid, sku text, barcode text,
   size text, color text, on_hand integer, reserved integer, outgoing integer, available integer, in_transit integer,
-  n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
+  incoming_approved integer, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
   unit_cost numeric, unit_price numeric, age_days integer
 )
 language plpgsql stable security definer set search_path = public as $$
@@ -3791,6 +3828,12 @@ begin
       from public.transfer_items i join public.transfers t on t.id = i.transfer_id
      where t.status in ('in_transit', 'short_received') group by 1, 2
   ),
+  -- معتمد للتحويل إلى الموقع ولم يُشحن بعد (حتى لا يُقترح نفس النقل مرتين)
+  incoming_appr as (
+    select t.to_location as loc, i.variant_id, sum(i.qty_approved - i.qty_shipped)::integer as qty
+      from public.transfer_items i join public.transfers t on t.id = i.transfer_id
+     where t.status in ('approved', 'in_transit') group by 1, 2
+  ),
   sales as (select * from public._location_sales()),
   pairs as (
     select l.id as loc, v.id as variant_id
@@ -3802,7 +3845,7 @@ begin
   select l.id, l.name, l.kind, v.id, p.id, p.name, p.category_id, v.sku, v.barcode, v.size, v.color,
          coalesce(s.qty, 0), coalesce(r.qty, 0), coalesce(o.qty, 0),
          coalesce(s.qty, 0) - coalesce(r.qty, 0) - coalesce(o.qty, 0),
-         coalesce(inc.qty, 0),
+         coalesce(inc.qty, 0), coalesce(ia.qty, 0),
          coalesce(sa.n7, 0), coalesce(sa.n30, 0), coalesce(sa.n60, 0), coalesce(sa.n90, 0), sa.last_sale_at,
          coalesce(vc.cost_price, 0), coalesce(v.price, p.base_price),
          greatest(ceil(extract(epoch from now() - greatest(v.created_at, l.created_at)) / 86400), 1)::integer
@@ -3814,6 +3857,7 @@ begin
     left join res r on r.location_id = l.id and r.variant_id = v.id
     left join outg o on o.loc = l.id and o.variant_id = v.id
     left join incoming inc on inc.loc = l.id and inc.variant_id = v.id
+    left join incoming_appr ia on ia.loc = l.id and ia.variant_id = v.id
     left join sales sa on sa.location_id = l.id and sa.variant_id = v.id
     left join public.variant_costs vc on vc.variant_id = v.id;
 end;
@@ -4172,8 +4216,8 @@ begin
                   add column surplus integer, add column rem_surplus integer;
   update _dc set target = ceil(avg_d * (p_lead_days + p_safety_days + p_cover_days))::integer,
                  rop = ceil(avg_d * (p_lead_days + p_safety_days))::integer;
-  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit <= rop
-                             then greatest(target - (available + in_transit), 0) else 0 end;
+  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit + incoming_approved <= rop
+                             then greatest(target - (available + in_transit + incoming_approved), 0) else 0 end;
   update _dc set surplus = case
                    when need > 0 then 0
                    when avg_d > 0 then greatest(available - target, 0)
@@ -4219,7 +4263,7 @@ begin
                                      'sold_7', d.n7, 'sold_30', d.n30, 'sold_60', d.n60, 'sold_90', d.n90,
                                      'avg_daily', d.avg_d, 'target', d.target, 'surplus', d.surplus),
           'to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
-                                   'in_transit', r.in_transit, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
+                                   'in_transit', r.in_transit + r.incoming_approved, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
                                    'sold_90', r.n90, 'avg_daily', r.avg_d, 'reorder_point', r.rop,
                                    'target', r.target, 'need', r.need),
           'qty', v_t));
@@ -4233,14 +4277,14 @@ begin
         r.variant_id, r.sku, r.product_name, r.label,
         null, null, r.location_id, r.location_name, v_remaining, r.unit_cost, r.unit_price,
         format('«%s» يبيع %s قطعة/يوم (باع %s خلال 30 يوماً)، والمتاح %s + القادم %s ≤ نقطة الطلب %s ← يحتاج %s. %s اشترِ %s.',
-               r.location_name, r.avg_d, r.n30, r.available, r.in_transit, r.rop, r.need,
+               r.location_name, r.avg_d, r.n30, r.available, r.in_transit + r.incoming_approved, r.rop, r.need,
                case when v_moved > 0 then format('يُغطّى %s بالنقل (%s)، والمتبقي بلا فائض في المواقع الأخرى ←',
                                                   v_moved, array_to_string(v_parts, '، '))
                     when v_elsewhere > 0 then format('متوفر %s في مواقع أخرى لكنها تحتاجه لمبيعاتها ←', v_elsewhere)
                     else 'لا يوجد في أي موقع آخر ←' end,
                v_remaining),
         jsonb_build_object('to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
-                                                    'in_transit', r.in_transit, 'sold_30', r.n30, 'sold_90', r.n90,
+                                                    'in_transit', r.in_transit + r.incoming_approved, 'sold_30', r.n30, 'sold_90', r.n90,
                                                     'avg_daily', r.avg_d, 'reorder_point', r.rop, 'target', r.target,
                                                     'need', r.need),
                            'covered_by_transfer', v_moved, 'available_elsewhere', v_elsewhere, 'qty', v_remaining));

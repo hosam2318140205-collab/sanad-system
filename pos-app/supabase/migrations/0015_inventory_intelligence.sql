@@ -80,7 +80,7 @@ returns table (
   location_id uuid, location_name text, location_kind public.location_kind,
   variant_id uuid, product_id uuid, product_name text, category_id uuid, sku text, barcode text,
   size text, color text, on_hand integer, reserved integer, outgoing integer, available integer, in_transit integer,
-  n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
+  incoming_approved integer, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
   unit_cost numeric, unit_price numeric, age_days integer
 )
 language plpgsql stable security definer set search_path = public as $$
@@ -105,6 +105,12 @@ begin
       from public.transfer_items i join public.transfers t on t.id = i.transfer_id
      where t.status in ('in_transit', 'short_received') group by 1, 2
   ),
+  -- معتمد للتحويل إلى الموقع ولم يُشحن بعد (حتى لا يُقترح نفس النقل مرتين)
+  incoming_appr as (
+    select t.to_location as loc, i.variant_id, sum(i.qty_approved - i.qty_shipped)::integer as qty
+      from public.transfer_items i join public.transfers t on t.id = i.transfer_id
+     where t.status in ('approved', 'in_transit') group by 1, 2
+  ),
   sales as (select * from public._location_sales()),
   pairs as (
     select l.id as loc, v.id as variant_id
@@ -116,7 +122,7 @@ begin
   select l.id, l.name, l.kind, v.id, p.id, p.name, p.category_id, v.sku, v.barcode, v.size, v.color,
          coalesce(s.qty, 0), coalesce(r.qty, 0), coalesce(o.qty, 0),
          coalesce(s.qty, 0) - coalesce(r.qty, 0) - coalesce(o.qty, 0),
-         coalesce(inc.qty, 0),
+         coalesce(inc.qty, 0), coalesce(ia.qty, 0),
          coalesce(sa.n7, 0), coalesce(sa.n30, 0), coalesce(sa.n60, 0), coalesce(sa.n90, 0), sa.last_sale_at,
          coalesce(vc.cost_price, 0), coalesce(v.price, p.base_price),
          greatest(ceil(extract(epoch from now() - greatest(v.created_at, l.created_at)) / 86400), 1)::integer
@@ -128,6 +134,7 @@ begin
     left join res r on r.location_id = l.id and r.variant_id = v.id
     left join outg o on o.loc = l.id and o.variant_id = v.id
     left join incoming inc on inc.loc = l.id and inc.variant_id = v.id
+    left join incoming_appr ia on ia.loc = l.id and ia.variant_id = v.id
     left join sales sa on sa.location_id = l.id and sa.variant_id = v.id
     left join public.variant_costs vc on vc.variant_id = v.id;
 end;

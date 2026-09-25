@@ -330,15 +330,17 @@ begin
   if p_client_ref is null then
     return false;
   end if;
-  select * into v from public.inventory_ops where client_ref = p_client_ref;
-  if v.client_ref is not null then
-    if v.op <> p_op or v.created_by is distinct from auth.uid() then
-      raise exception 'مرجع العملية مستخدم مسبقاً';
-    end if;
-    return true;
+  -- الحجز بالإدراج: جلسة متزامنة بنفس المرجع تنتظر هنا ثم تعامَل كتكرار (لا خطأ تفرد ولا تنفيذ مزدوج)
+  insert into public.inventory_ops (client_ref, op, ref_id) values (p_client_ref, p_op, p_ref)
+  on conflict (client_ref) do nothing;
+  if found then
+    return false;
   end if;
-  insert into public.inventory_ops (client_ref, op, ref_id) values (p_client_ref, p_op, p_ref);
-  return false;
+  select * into v from public.inventory_ops where client_ref = p_client_ref;
+  if v.op <> p_op or v.created_by is distinct from auth.uid() then
+    raise exception 'مرجع العملية مستخدم مسبقاً';
+  end if;
+  return true;
 end;
 $$;
 
@@ -496,6 +498,8 @@ begin
     raise exception 'غير مصرح';
   end if;
   if p_client_ref is not null then
+    -- نفس الطلب من جلستين متزامنتين: الثانية تنتظر ثم تجد الطلب الأول
+    perform pg_advisory_xact_lock(hashtextextended('transfer:' || p_client_ref::text, 0));
     select * into v_existing from public.transfers where client_ref = p_client_ref;
     if v_existing.id is not null then
       if v_existing.requested_by is distinct from auth.uid() then
@@ -889,6 +893,8 @@ revoke all on function
   public._outgoing_pending(uuid, uuid, uuid), public._can_act_at(uuid), public._transfer_refresh(uuid, boolean),
   public.locations_guard()
 from public, anon, authenticated;
+-- تستخدمها سياسة transfers_select وتعيد موقع المستخدم نفسه فقط
+grant execute on function public._my_location() to authenticated;
 
 revoke execute on function
   public.adjust_location_stock(uuid, uuid, integer, text, uuid),

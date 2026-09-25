@@ -82,12 +82,14 @@ declare
   c public.stock_counts;
   v_variant record;
   v_item public.stock_count_items;
+  v_scan bigint;
   v_code text := trim(coalesce(p_code, ''));
 begin
   if not public.is_staff() then
     raise exception 'غير مصرح';
   end if;
-  select * into c from public.stock_counts where id = p_count_id;
+  -- قفل مشترك: المسحات المتزامنة تمر معاً، أما الإرسال/الاعتماد (FOR UPDATE) فينتظرها
+  select * into c from public.stock_counts where id = p_count_id for share;
   if c.id is null or c.status <> 'open' then
     raise exception 'الجرد غير مفتوح';
   end if;
@@ -100,14 +102,19 @@ begin
     raise exception 'لا يوجد صنف بالرمز %', v_code;
   end if;
 
-  -- نفس المسحة أُرسلت سابقاً (ضغط مزدوج/إعادة إرسال): لا تُحسب مرة ثانية
-  if p_client_ref is not null and exists (select 1 from public.stock_count_scans where client_ref = p_client_ref) then
+  if coalesce(p_qty, 0) = 0 then
+    raise exception 'كمية غير صحيحة';
+  end if;
+
+  -- المسحة تحجز مرجعها أولاً: نفس المسحة (ضغط مزدوج/إعادة إرسال، ولو من جلستين متزامنتين) لا تُحسب مرتين
+  insert into public.stock_count_scans (count_id, variant_id, qty, client_ref)
+  values (p_count_id, v_variant.id, p_qty, p_client_ref)
+  on conflict (client_ref) do nothing
+  returning id into v_scan;
+  if v_scan is null then
     select * into v_item from public.stock_count_items where count_id = p_count_id and variant_id = v_variant.id;
     return jsonb_build_object('variant_id', v_variant.id, 'sku', v_variant.sku, 'name', v_variant.name,
                               'label', v_variant.label, 'counted', v_item.counted_qty, 'duplicate', true);
-  end if;
-  if coalesce(p_qty, 0) = 0 then
-    raise exception 'كمية غير صحيحة';
   end if;
 
   insert into public.stock_count_items (count_id, variant_id, expected_qty)
@@ -117,6 +124,7 @@ begin
   on conflict (count_id, variant_id) do nothing;
 
   -- التحديث يقفل الصف: مسحات متزامنة لنفس الصنف تُجمع بالترتيب
+  perform set_config('app.count_rpc', 'on', true);
   update public.stock_count_items
      set counted_qty = coalesce(counted_qty, 0) + p_qty, counted_by = auth.uid(), counted_at = clock_timestamp()
    where count_id = p_count_id and variant_id = v_variant.id
@@ -124,7 +132,7 @@ begin
   if v_item.counted_qty < 0 then
     raise exception 'الكمية المعدودة لا تكون سالبة';
   end if;
-  insert into public.stock_count_scans (count_id, variant_id, qty, client_ref) values (p_count_id, v_variant.id, p_qty, p_client_ref);
+  perform set_config('app.count_rpc', '', true);
 
   return jsonb_build_object('variant_id', v_variant.id, 'sku', v_variant.sku, 'name', v_variant.name,
                             'label', v_variant.label, 'counted', v_item.counted_qty, 'duplicate', false);
@@ -138,14 +146,22 @@ language plpgsql security definer set search_path = public as $$
 declare
   v_current integer;
 begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if (select status from public.stock_counts where id = p_count_id) is distinct from 'open' then
+    raise exception 'الجرد غير مفتوح';
+  end if;
   if p_qty is null or p_qty < 0 then
     raise exception 'كمية غير صحيحة';
   end if;
   select coalesce(counted_qty, 0) into v_current from public.stock_count_items
    where count_id = p_count_id and variant_id = p_variant for update;
   if p_qty = coalesce(v_current, 0) then
+    perform set_config('app.count_rpc', 'on', true);
     update public.stock_count_items set counted_qty = p_qty, counted_by = auth.uid(), counted_at = clock_timestamp()
      where count_id = p_count_id and variant_id = p_variant and counted_qty is null;
+    perform set_config('app.count_rpc', '', true);
     return jsonb_build_object('counted', p_qty);
   end if;
   return public.record_count_scan(p_count_id, (select sku from public.product_variants where id = p_variant),
@@ -318,9 +334,24 @@ $$;
 create trigger stock_counts_guard_legacy_apply before update of status on public.stock_counts
   for each row execute function public.guard_legacy_apply();
 
--- جرد أعمى: الكمية النظامية لا تُقرأ مباشرة (المدير يراها عبر count_review)، والعدّ عبر الدوال فقط
-revoke select, update on public.stock_count_items from authenticated;
+-- جرد أعمى: الكمية النظامية لا تُقرأ مباشرة (المدير يراها عبر count_review)
+revoke select on public.stock_count_items from authenticated;
 grant select (id, count_id, variant_id, counted_qty, counted_by, counted_at) on public.stock_count_items to authenticated;
+
+-- جرد الموقع يُعدّ عبر المسحات فقط (سجل كامل ومنع التكرار). الجرد القديم (بلا موقع) يبقى كما كان
+create or replace function public.guard_count_item_update()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.counted_qty is distinct from old.counted_qty
+     and coalesce(current_setting('app.count_rpc', true), '') <> 'on'
+     and (select location_id from public.stock_counts where id = new.count_id) is not null then
+    raise exception 'جرد الموقع يُسجَّل بالمسح أو إدخال الكمية فقط';
+  end if;
+  return new;
+end;
+$$;
+create trigger stock_count_items_guard before update on public.stock_count_items
+  for each row execute function public.guard_count_item_update();
 
 alter table public.stock_count_scans enable row level security;
 revoke all on public.stock_count_scans from anon;
@@ -329,7 +360,7 @@ grant select on public.stock_count_scans to authenticated;
 create policy count_scans_select on public.stock_count_scans for select to authenticated using (public.is_staff());
 
 revoke all on function public._location_qty_at(uuid, uuid, timestamptz), public.guard_legacy_count(),
-  public.guard_legacy_apply() from public, anon, authenticated;
+  public.guard_legacy_apply(), public.guard_count_item_update() from public, anon, authenticated;
 revoke execute on function
   public.start_location_count(uuid, uuid, text),
   public.record_count_scan(uuid, text, integer, uuid),
