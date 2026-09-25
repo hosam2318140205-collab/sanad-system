@@ -31,6 +31,9 @@ step supabase/tests/shifts_test.sql
 echo "▶ Expenses: drawer link, locks, summary, permissions"
 step supabase/tests/expenses_test.sql
 
+echo "▶ Purchase advisor: rates, reorder point, suggestions, dead stock, drafts, permissions"
+step supabase/tests/advisor_test.sql
+
 echo "▶ Demo data: seed, remove, re-seed"
 step supabase/tests/demo_data_test.sql
 
