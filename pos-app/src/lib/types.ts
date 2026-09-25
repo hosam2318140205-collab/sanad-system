@@ -4,7 +4,7 @@ export type RefundMethod = "cash" | "card" | "transfer" | "exchange";
 export type SaleStatus = "completed" | "partially_returned" | "returned";
 export type PurchaseStatus = "draft" | "ordered" | "received" | "cancelled";
 export type MovementType = "opening" | "sale" | "return" | "purchase" | "adjustment" | "count";
-export type CountStatus = "open" | "applied" | "cancelled";
+export type CountStatus = "open" | "submitted" | "applied" | "cancelled";
 
 export interface Profile {
   id: string;
@@ -34,6 +34,7 @@ export interface StoreSettings {
   return_days: number;
   currency: string;
   require_shift: boolean;
+  inventory_segregation?: boolean;
 }
 
 export interface Category {
@@ -182,6 +183,10 @@ export interface StockCount {
   notes: string | null;
   applied_at: string | null;
   created_at: string;
+  location_id: string | null;
+  snapshot_at: string | null;
+  submitted_at: string | null;
+  cancel_reason: string | null;
 }
 
 export interface StockCountItem {

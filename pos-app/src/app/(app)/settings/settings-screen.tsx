@@ -42,6 +42,7 @@ export function SettingsScreen() {
         allow_negative_stock: s.allow_negative_stock,
         allow_cashier_returns: s.allow_cashier_returns,
         require_shift: s.require_shift,
+        inventory_segregation: !!s.inventory_segregation,
         max_cashier_discount_pct: Number(s.max_cashier_discount_pct),
         return_days: Number(s.return_days),
       })
@@ -110,6 +111,11 @@ export function SettingsScreen() {
           <Checkbox label="السماح بالبيع عند نفاد المخزون (مخزون سالب)" checked={s.allow_negative_stock} onChange={(v) => set("allow_negative_stock", v)} />
           <Checkbox label="السماح للكاشير بالإرجاع والاستبدال" checked={s.allow_cashier_returns} onChange={(v) => set("allow_cashier_returns", v)} />
           <Checkbox label="البيع والإرجاع النقدي يتطلبان وردية مفتوحة" checked={s.require_shift} onChange={(v) => set("require_shift", v)} />
+          <Checkbox
+            label="فصل المهام في المخزون: من يطلب التحويل لا يعتمده، ومن سجّل فرق الاستلام لا يعتمد فقده"
+            checked={!!s.inventory_segregation}
+            onChange={(v) => set("inventory_segregation", v)}
+          />
           <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">
             تغيير نسبة الضريبة أو طريقة التسعير يؤثر على الفواتير الجديدة فقط. الفواتير السابقة تحتفظ بنسبتها.
           </p>
