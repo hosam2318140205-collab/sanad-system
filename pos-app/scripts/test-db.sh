@@ -31,6 +31,9 @@ step supabase/tests/shifts_test.sql
 echo "▶ Expenses: drawer link, locks, summary, permissions"
 step supabase/tests/expenses_test.sql
 
+echo "▶ Purchase advisor: rates, reorder point, suggestions, dead stock, drafts, permissions"
+step supabase/tests/advisor_test.sql
+
 echo "▶ Sales & Customers 2.0: credit, collections, loyalty, promotions, reservations, QR, permissions"
 step supabase/tests/sales_customers_test.sql
 

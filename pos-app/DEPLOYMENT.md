@@ -121,6 +121,7 @@ select email, role, is_active from public.profiles;
 |---|---|
 | `upgrades/0006_shifts.sql` | الورديات وإغلاق الصندوق |
 | `upgrades/0007_expenses.sql` | المصروفات وصافي الربح (يتطلب تنفيذ 0006 قبله) |
+| `upgrades/0008_purchase_advisor.sql` | مساعد الشراء الذكي (دوال قراءة + إنشاء مسودة شراء فقط — لا يغيّر أي جدول) |
 | `upgrades/0009_customer_accounts.sql` ← `0010` ← `0011` ← `0012` | Sales & Customers 2.0 — **تُنفَّذ الأربعة بالترتيب قبل دمج الكود** (انظر أدناه) |
 
 ### Sales & Customers 2.0 (0009–0012): ترتيب عكسي — قاعدة البيانات أولاً
