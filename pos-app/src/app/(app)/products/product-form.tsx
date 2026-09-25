@@ -3,13 +3,13 @@
 import { ArrowRight, ImagePlus, Printer, Sparkles, Trash2, Wand2 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BarcodeLabels, type LabelItem } from "@/components/barcode-labels";
 import { CameraScanButton, CameraScanner } from "@/components/camera-scanner";
 import { PrintPortal } from "@/components/print-portal";
 import { useSession } from "@/components/session-context";
 import { Badge, Button, Card, Checkbox, Field, Input, Loading, Modal, PageHeader, Select, Table, Textarea, useToast } from "@/components/ui";
-import { generateEan13, makeSku } from "@/lib/barcode";
+import { generateEan13Batch, makeSku, skuBatchCode } from "@/lib/barcode";
 import { errorMessage, variantLabel } from "@/lib/format";
 import { printNow } from "@/lib/sales";
 import { supabase } from "@/lib/supabase/client";
@@ -87,6 +87,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
   const [labels, setLabels] = useState<LabelItem[] | null>(null);
   const [labelsOpen, setLabelsOpen] = useState(false);
   const [scanRow, setScanRow] = useState<string | null>(null);
+  const variantsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const db = supabase();
@@ -152,51 +153,72 @@ export function ProductForm({ productId }: { productId: string | null }) {
   const setRow = (key: string, patch: Partial<VariantRow>) =>
     setRows((rs) => rs.map((r) => (r.key === key ? { ...r, ...patch } : r)));
 
-  const sizes = sizesInput
-    .split(/[,،\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // مقاسات فريدة بالترتيب المُدخل ("39,39" تُحسب مرة واحدة)
+  const sizes = [
+    ...new Set(
+      sizesInput
+        .split(/[,،\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  ];
 
+  // المقاسات × الألوان (Cartesian product). لا يكرر تركيبة موجودة، ولا يمس بيانات المنتج أو الصفوف الحالية.
   const generate = () => {
     const sizeList = sizes.length ? sizes : [""];
     const colorList = colors.length ? colors : [{ name: "", hex: "" }];
     const existing = new Set(rows.filter((r) => !r.deleted).map((r) => `${r.size}|${r.color}`));
-    const added: VariantRow[] = [];
-    let seq = rows.length;
+    const combos: { size: string; color: { name: string; hex: string } }[] = [];
     for (const c of colorList) {
       for (const s of sizeList) {
-        if (existing.has(`${s}|${c.name}`)) continue;
-        seq++;
-        added.push({
-          key: newKey(),
-          id: null,
-          size: s,
-          color: c.name,
-          color_hex: c.hex,
-          sku: makeSku(form.name_en || form.name, s || null, c.name || null, seq),
-          barcode: generateEan13(),
-          price: "",
-          cost: form.default_cost || "0",
-          opening: "0",
-          low: "3",
-          is_active: true,
-          stock_qty: 0,
-          deleted: false,
-        });
+        const key = `${s}|${c.name}`;
+        if (existing.has(key)) continue;
+        existing.add(key);
+        combos.push({ size: s, color: c });
       }
     }
-    if (added.length === 0) toast("كل التركيبات موجودة مسبقاً", "info");
-    // SKU فريد داخل المنتج
-    const used = new Set(rows.map((r) => r.sku));
-    for (const a of added) {
-      let sku = a.sku;
-      let n = 2;
-      while (used.has(sku)) sku = `${a.sku}-${n++}`;
-      a.sku = sku;
-      used.add(sku);
+    if (combos.length === 0) {
+      toast("كل هذه التركيبات موجودة في الجدول — لم يُضف شيء", "info");
+      return;
     }
+
+    const batch = skuBatchCode();
+    const barcodes = generateEan13Batch(
+      combos.length,
+      rows.map((r) => r.barcode).filter(Boolean),
+    );
+    const usedSkus = new Set(rows.map((r) => r.sku));
+    let seq = rows.length;
+    const added: VariantRow[] = combos.map(({ size, color }, i) => {
+      seq++;
+      const base = makeSku(form.name_en || form.name, size || null, color.name || null, seq, batch);
+      let sku = base;
+      for (let n = 2; usedSkus.has(sku); n++) sku = `${base}-${n}`;
+      usedSkus.add(sku);
+      return {
+        key: newKey(),
+        id: null,
+        size,
+        color: color.name,
+        color_hex: color.hex,
+        sku,
+        barcode: barcodes[i],
+        price: "",
+        cost: "", // فارغ = يرث «تكلفة الشراء الافتراضية» عند الحفظ
+        opening: "0",
+        low: "3",
+        is_active: true,
+        stock_qty: 0,
+        deleted: false,
+      };
+    });
     setRows((r) => [...r, ...added]);
+    toast(`تمت إضافة ${added.length} تركيبة`);
+    setTimeout(() => variantsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
   };
+
+  const newBarcodeFor = (key: string) =>
+    generateEan13Batch(1, rows.filter((r) => r.key !== key).map((r) => r.barcode).filter(Boolean))[0];
 
   const addColor = (name: string, hex: string) => {
     if (!name.trim() || colors.some((c) => c.name === name.trim())) return;
@@ -208,6 +230,8 @@ export function ProductForm({ productId }: { productId: string | null }) {
     setImageFile(file);
     setImagePreview(file ? URL.createObjectURL(file) : null);
   };
+
+  const effectiveCost = (r: VariantRow) => Number(r.cost === "" ? form.default_cost : r.cost) || 0;
 
   const save = async () => {
     const active = rows.filter((r) => !r.deleted);
@@ -275,7 +299,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
         if (r.id) {
           const { error } = await db.from("product_variants").update(base).eq("id", r.id);
           if (error) throw error;
-          costs.push({ variant_id: r.id, cost_price: Number(r.cost) || 0 });
+          costs.push({ variant_id: r.id, cost_price: effectiveCost(r) });
         } else {
           const { data, error } = await db
             .from("product_variants")
@@ -283,7 +307,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
             .select("id")
             .single();
           if (error) throw error;
-          costs.push({ variant_id: (data as { id: string }).id, cost_price: Number(r.cost) || 0 });
+          costs.push({ variant_id: (data as { id: string }).id, cost_price: effectiveCost(r) });
         }
       }
       if (costs.length) {
@@ -323,7 +347,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
   const visibleRows = rows.filter((r) => !r.deleted);
   const margin = (r: VariantRow) => {
     const price = Number(r.price || form.base_price);
-    const cost = Number(r.cost);
+    const cost = effectiveCost(r);
     if (!price || !cost) return null;
     const net = settings.prices_include_vat ? price / (1 + Number(settings.vat_rate) / 100) : price;
     return ((net - cost) / net) * 100;
@@ -462,9 +486,17 @@ export function ProductForm({ productId }: { productId: string | null }) {
             )}
           </div>
         </div>
-        <Button variant="secondary" onClick={generate} disabled={!form.name.trim()}>
+        <Button variant="secondary" onClick={generate}>
           <Sparkles className="size-4" /> توليد التركيبات ({Math.max(sizes.length, 1) * Math.max(colors.length, 1)})
         </Button>
+
+        <div ref={variantsRef} className="scroll-mt-20">
+          {visibleRows.length > 0 && (
+            <p className="text-sm text-slate-600" data-testid="variants-count">
+              التركيبات: <span className="font-semibold text-slate-900">{visibleRows.length}</span>
+            </p>
+          )}
+        </div>
 
         {/* الجوال: بطاقة لكل مقاس/لون بكل الحقول ظاهرة بدون تمرير أفقي */}
         {visibleRows.length > 0 && (
@@ -498,11 +530,11 @@ export function ProductForm({ productId }: { productId: string | null }) {
                     <Field label="اللون">
                       <Input className="h-9" value={r.color} onChange={(e) => setRow(r.key, { color: e.target.value })} />
                     </Field>
-                    <Field label="سعر خاص">
+                    <Field label="سعر البيع">
                       <Input type="number" inputMode="decimal" step="0.01" className="h-9" placeholder={form.base_price || "-"} value={r.price} onChange={(e) => setRow(r.key, { price: e.target.value })} />
                     </Field>
                     <Field label="التكلفة" hint={m !== null ? `هامش ${m.toFixed(0)}%` : undefined}>
-                      <Input type="number" inputMode="decimal" step="0.01" className="h-9" value={r.cost} onChange={(e) => setRow(r.key, { cost: e.target.value })} />
+                      <Input type="number" inputMode="decimal" step="0.01" className="h-9" placeholder={form.default_cost || "0"} value={r.cost} onChange={(e) => setRow(r.key, { cost: e.target.value })} />
                     </Field>
                     {!r.id && (
                       <Field label="رصيد افتتاحي">
@@ -519,7 +551,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
                       <div className="flex gap-2">
                         <Input dir="ltr" inputMode="numeric" className="h-9 min-w-0 flex-1" value={r.barcode} onChange={(e) => setRow(r.key, { barcode: e.target.value })} />
                         <CameraScanButton size="sm" className="h-9 shrink-0" label="مسح باركود القطعة" onClick={() => setScanRow(r.key)} />
-                        <Button type="button" variant="outline" size="sm" className="h-9 shrink-0" onClick={() => setRow(r.key, { barcode: generateEan13() })}>
+                        <Button type="button" variant="outline" size="sm" className="h-9 shrink-0" onClick={() => setRow(r.key, { barcode: newBarcodeFor(r.key) })}>
                           توليد
                         </Button>
                       </div>
@@ -539,11 +571,11 @@ export function ProductForm({ productId }: { productId: string | null }) {
                 <th>اللون</th>
                 <th>SKU</th>
                 <th>الباركود</th>
-                <th>سعر خاص</th>
+                <th>سعر البيع</th>
                 <th>التكلفة</th>
                 <th>{productId ? "المخزون" : "رصيد افتتاحي"}</th>
                 <th>حد التنبيه</th>
-                <th>نشط</th>
+                <th>الحالة</th>
                 <th></th>
               </tr>
             </thead>
@@ -567,7 +599,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
                     <td>
                       <div className="flex items-center gap-1">
                         <Input dir="ltr" className="h-9 w-36" value={r.barcode} onChange={(e) => setRow(r.key, { barcode: e.target.value })} />
-                        <button className="text-xs text-brand-700 hover:underline" onClick={() => setRow(r.key, { barcode: generateEan13() })} title="توليد باركود">
+                        <button className="text-xs text-brand-700 hover:underline" onClick={() => setRow(r.key, { barcode: newBarcodeFor(r.key) })} title="توليد باركود">
                           توليد
                         </button>
                       </div>
@@ -576,7 +608,7 @@ export function ProductForm({ productId }: { productId: string | null }) {
                       <Input type="number" step="0.01" className="h-9 w-24" placeholder={form.base_price || "-"} value={r.price} onChange={(e) => setRow(r.key, { price: e.target.value })} />
                     </td>
                     <td>
-                      <Input type="number" step="0.01" className="h-9 w-24" value={r.cost} onChange={(e) => setRow(r.key, { cost: e.target.value })} />
+                      <Input type="number" step="0.01" className="h-9 w-24" placeholder={form.default_cost || "0"} value={r.cost} onChange={(e) => setRow(r.key, { cost: e.target.value })} />
                       {m !== null && <div className={`mt-0.5 text-xs ${m < 0 ? "text-red-600" : "text-slate-500"}`}>هامش {m.toFixed(0)}%</div>}
                     </td>
                     <td>
