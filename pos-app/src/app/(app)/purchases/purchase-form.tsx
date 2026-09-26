@@ -11,6 +11,7 @@ import { PURCHASE_STATUS_LABELS, dateTime, errorMessage, money, round2, variantL
 import { fetchLocations, type Location } from "@/lib/inventory";
 import { supabase } from "@/lib/supabase/client";
 import type { CatalogItem, PurchaseOrder, PurchaseStatus, Supplier } from "@/lib/types";
+import { PurchaseDocuments } from "./purchase-documents";
 
 interface Line {
   variant_id: string;
@@ -203,7 +204,11 @@ export function PurchaseForm({ id }: { id: string | null }) {
                 <ArrowRight className="size-4" /> رجوع
               </Button>
             </Link>
-            {po && <Badge tone={po.status === "received" ? "green" : "slate"}>{PURCHASE_STATUS_LABELS[po.status]}</Badge>}
+            {po && (
+              <Badge tone={po.status === "received" ? "green" : po.status === "partially_received" || po.status === "ordered" ? "blue" : "slate"}>
+                {PURCHASE_STATUS_LABELS[po.status]}
+              </Badge>
+            )}
             {editable && (
               <>
                 {po && (
@@ -218,7 +223,7 @@ export function PurchaseForm({ id }: { id: string | null }) {
                   حفظ كمطلوب
                 </Button>
                 <Button onClick={() => setConfirm("receive")} disabled={busy || lines.length === 0}>
-                  <PackageCheck className="size-4" /> استلام البضاعة
+                  <PackageCheck className="size-4" /> استلام كامل
                 </Button>
               </>
             )}
@@ -343,6 +348,16 @@ export function PurchaseForm({ id }: { id: string | null }) {
           </Table>
         </Card>
       </div>
+
+      {po && (
+        <PurchaseDocuments
+          po={po}
+          onChange={async () => {
+            const { data } = await supabase().from("purchase_orders").select("*").eq("id", po.id).single();
+            if (data) setPo(data as PurchaseOrder);
+          }}
+        />
+      )}
 
       <ConfirmDialog
         open={confirm === "receive"}

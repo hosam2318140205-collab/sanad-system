@@ -2,7 +2,7 @@ export type UserRole = "owner" | "manager" | "cashier";
 export type PaymentMethod = "cash" | "card" | "transfer" | "exchange_credit";
 export type RefundMethod = "cash" | "card" | "transfer" | "exchange";
 export type SaleStatus = "completed" | "partially_returned" | "returned";
-export type PurchaseStatus = "draft" | "ordered" | "received" | "cancelled";
+export type PurchaseStatus = "draft" | "ordered" | "partially_received" | "received" | "closed" | "cancelled";
 export type MovementType = "opening" | "sale" | "return" | "purchase" | "adjustment" | "count" | "supplier_return";
 export type CountStatus = "open" | "submitted" | "applied" | "cancelled";
 
@@ -35,6 +35,11 @@ export interface StoreSettings {
   currency: string;
   require_shift: boolean;
   inventory_segregation?: boolean;
+  purchase_match_tolerance_pct?: number;
+  supplier_weight_price?: number;
+  supplier_weight_lead?: number;
+  supplier_weight_fill?: number;
+  supplier_weight_quality?: number;
 }
 
 export interface Category {
@@ -96,6 +101,12 @@ export interface Supplier {
   address: string | null;
   notes: string | null;
   is_active: boolean;
+  code?: string | null;
+  payment_terms_days?: number;
+  credit_limit?: number | null;
+  iban?: string | null;
+  vat_registered?: boolean;
+  lead_time_days?: number | null;
 }
 
 export interface Sale {
@@ -165,6 +176,9 @@ export interface PurchaseOrder {
   notes: string | null;
   received_at: string | null;
   created_at: string;
+  location_id?: string | null;
+  expected_at?: string | null;
+  close_reason?: string | null;
 }
 
 export interface PurchaseItem {
