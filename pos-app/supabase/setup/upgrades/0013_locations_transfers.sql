@@ -266,8 +266,10 @@ create constraint trigger variant_stock_invariant
 -- الأرصدة الحالية كلها في الموقع الرئيسي (إضافة فقط — لا تغيير على أي صف قائم)
 insert into public.location_stock (location_id, variant_id, qty)
 select public._default_location(), id, stock_qty from public.product_variants where stock_qty <> 0;
-insert into public.location_movements (location_id, variant_id, type, qty_change, balance_after, note)
-select public._default_location(), id, 'opening', stock_qty, stock_qty, 'رصيد عند تفعيل المواقع'
+-- الرصيد الافتتاحي يُؤرَّخ بتاريخ إضافة الصنف لا بلحظة الترقية: وإلا بدا كل المخزون «وصل اليوم»
+-- (راكد = 0 يوم، وحماية الوارد الجديد تمنع اقتراح النقل من الرئيسي 30 يوماً)
+insert into public.location_movements (location_id, variant_id, type, qty_change, balance_after, note, created_at)
+select public._default_location(), id, 'opening', stock_qty, stock_qty, 'رصيد عند تفعيل المواقع', created_at
   from public.product_variants where stock_qty <> 0;
 
 -- ---------------------------------------------------------------------

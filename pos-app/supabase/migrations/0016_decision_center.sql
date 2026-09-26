@@ -17,7 +17,7 @@ returns table (
   from_location uuid, from_name text, to_location uuid, to_name text, qty integer,
   unit_cost numeric, unit_price numeric, cost_value numeric, retail_value numeric, reason text, why jsonb
 )
-language plpgsql volatile security definer set search_path = public as $$
+language plpgsql volatile security definer set search_path = public set client_min_messages = warning as $$
 #variable_conflict use_column
 declare
   r record;

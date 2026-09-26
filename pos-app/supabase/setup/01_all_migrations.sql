@@ -2685,8 +2685,10 @@ create constraint trigger variant_stock_invariant
 -- الأرصدة الحالية كلها في الموقع الرئيسي (إضافة فقط — لا تغيير على أي صف قائم)
 insert into public.location_stock (location_id, variant_id, qty)
 select public._default_location(), id, stock_qty from public.product_variants where stock_qty <> 0;
-insert into public.location_movements (location_id, variant_id, type, qty_change, balance_after, note)
-select public._default_location(), id, 'opening', stock_qty, stock_qty, 'رصيد عند تفعيل المواقع'
+-- الرصيد الافتتاحي يُؤرَّخ بتاريخ إضافة الصنف لا بلحظة الترقية: وإلا بدا كل المخزون «وصل اليوم»
+-- (راكد = 0 يوم، وحماية الوارد الجديد تمنع اقتراح النقل من الرئيسي 30 يوماً)
+insert into public.location_movements (location_id, variant_id, type, qty_change, balance_after, note, created_at)
+select public._default_location(), id, 'opening', stock_qty, stock_qty, 'رصيد عند تفعيل المواقع', created_at
   from public.product_variants where stock_qty <> 0;
 
 -- ---------------------------------------------------------------------
@@ -3751,7 +3753,8 @@ $$;
 
 -- المبيعات الصافية لكل موقع وصنف (بعد المرتجعات) في نوافذ 7/30/60/90 يوماً + آخر بيع
 create or replace function public._location_sales()
-returns table (location_id uuid, variant_id uuid, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz)
+returns table (location_id uuid, variant_id uuid, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
+               first_sale_at timestamptz)
 language sql stable security definer set search_path = public as $$
   with d as (select public._default_location() as def),
   s as (
@@ -3777,7 +3780,7 @@ language sql stable security definer set search_path = public as $$
     union all select loc, variant_id, -qty, created_at from r
   ),
   last_sale as (
-    select coalesce(sh.location_id, d.def) as loc, si.variant_id, max(sa.created_at) as at
+    select coalesce(sh.location_id, d.def) as loc, si.variant_id, max(sa.created_at) as at, min(sa.created_at) as first_at
       from public.sale_items si
       join public.sales sa on sa.id = si.sale_id
       left join public.shifts sh on sh.id = sa.shift_id
@@ -3793,7 +3796,7 @@ language sql stable security definer set search_path = public as $$
       from signed group by loc, variant_id
   )
   select coalesce(a.loc, l.loc), coalesce(a.variant_id, l.variant_id),
-         coalesce(a.n7, 0), coalesce(a.n30, 0), coalesce(a.n60, 0), coalesce(a.n90, 0), l.at
+         coalesce(a.n7, 0), coalesce(a.n30, 0), coalesce(a.n60, 0), coalesce(a.n90, 0), l.at, l.first_at
     from agg a full join last_sale l on l.loc = a.loc and l.variant_id = a.variant_id
 $$;
 
@@ -3848,7 +3851,12 @@ begin
          coalesce(inc.qty, 0), coalesce(ia.qty, 0),
          coalesce(sa.n7, 0), coalesce(sa.n30, 0), coalesce(sa.n60, 0), coalesce(sa.n90, 0), sa.last_sale_at,
          coalesce(vc.cost_price, 0), coalesce(v.price, p.base_price),
-         greatest(ceil(extract(epoch from now() - greatest(v.created_at, l.created_at)) / 86400), 1)::integer
+         -- عمر الصنف في الموقع (لتطبيع متوسط البيع): من إضافة الصنف أو افتتاح الموقع، أيهما أحدث.
+         -- الموقع الافتراضي يمثل تاريخ المتجر كله (أُنشئ لحظة الترقية) فلا يُحتسب تاريخ إنشائه،
+         -- ولا يكون العمر أقصر من أول بيع مسجل في الموقع
+         greatest(ceil(extract(epoch from now() - least(
+           greatest(v.created_at, case when l.is_default then v.created_at else l.created_at end),
+           coalesce(sa.first_sale_at, 'infinity'::timestamptz))) / 86400), 1)::integer
     from pairs pr
     join locs l on l.id = pr.loc
     join public.product_variants v on v.id = pr.variant_id
@@ -4180,7 +4188,7 @@ returns table (
   from_location uuid, from_name text, to_location uuid, to_name text, qty integer,
   unit_cost numeric, unit_price numeric, cost_value numeric, retail_value numeric, reason text, why jsonb
 )
-language plpgsql volatile security definer set search_path = public as $$
+language plpgsql volatile security definer set search_path = public set client_min_messages = warning as $$
 #variable_conflict use_column
 declare
   r record;

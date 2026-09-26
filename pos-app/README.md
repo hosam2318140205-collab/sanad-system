@@ -71,13 +71,17 @@ supabase/
     0006_shifts.sql          الورديات وإغلاق الصندوق (عدّ أعمى، مطابقة الدرج، تقرير Z)
     0007_expenses.sql        المصروفات، الربط بدرج الوردية، إيصالات خاصة، ملخص صافي الربح
     0008_purchase_advisor.sql  مساعد الشراء: تحليل الأصناف، الراكد، مسودة أمر شراء من التوصيات
+    0013_locations_transfers.sql  الفروع والمستودعات، رصيد لكل موقع (مجموعه = الإجمالي دائماً)، التحويلات
+    0014_smart_counts.sql      جرد لكل موقع: مسح بمفتاح فريد، لقطة + حركات بعدها، اعتماد المدير
+    0015_inventory_intelligence.sql  المتاح للبيع، المقاسات الناقصة، الشاذ، الراكد
+    0016_decision_center.sql   مركز القرارات: انقل قبل أن تشتري، مع «لماذا؟» بالأرقام
   setup/                     ما يُنفَّذ في SQL Editor على Production
     01_all_migrations.sql    كل الـ migrations في ملف واحد (مولَّد — لا يُعدَّل يدوياً)
     02_demo_data.sql         بيانات تجريبية معلَّمة (DEMO-) — اختياري
     03_remove_demo_data.sql  حذف البيانات التجريبية فقط
     04_reset_test_transactions.sql  تصفير فواتير التجربة قبل الافتتاح (يتطلب تأكيداً)
     upgrades/                ترقيات لمشروع قائم: ملف لكل migration جديدة (مولَّد)
-  tests/                     smoke_test.sql, shifts_test.sql, expenses_test.sql, advisor_test.sql, demo_data_test.sql, supabase_stub.sql
+  tests/                     smoke, shifts, expenses, advisor, demo_data, inventory_test.sql, inventory_concurrency.sh, supabase_stub.sql
 scripts/                     bundle-migrations, check-bundle-secrets, test-db
 src/
   proxy.ts                   تحديث جلسة Supabase وحماية المسارات (Next 16 proxy)

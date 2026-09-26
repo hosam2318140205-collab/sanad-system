@@ -384,6 +384,21 @@ do $$ begin
 end $$;
 reset role;
 
+-- ============ 9) بعد الترقية: الموقع الافتراضي أُنشئ «اليوم» لكن أصنافه قديمة ============
+-- عمر الصنف لا يُقصَّر بتاريخ إنشاء الموقع الافتراضي، ولا يكون أقصر من أول بيع في الموقع
+update public.locations set created_at = now() where code = 'MAIN';
+update public.locations set created_at = now() - interval '2 days' where code = 'BR2';
+set local role authenticated;
+select pg_temp.as_user('00000000-0000-0000-0000-0000000000f1');
+do $$ begin
+  assert (select age_days from public.location_availability(pg_temp.loc('MAIN')) where sku = 'SHO-42') >= 120,
+    'default location age follows the variant, not the upgrade date';
+  -- الفرع أُنشئ قبل يومين لكن أول بيع فيه قبل 20 يوماً (بيانات مُرحَّلة) ← العمر ≥ 20
+  assert (select age_days from public.location_availability(pg_temp.loc('BR2')) where sku = 'SHO-42') >= 20,
+    'age is never shorter than the first sale at the location';
+end $$;
+reset role;
+
 set constraints all immediate;
 do $$ begin
   assert pg_temp.invariant_ok(), 'final invariant';
