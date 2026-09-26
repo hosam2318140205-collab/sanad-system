@@ -40,6 +40,9 @@ step supabase/tests/demo_data_test.sql
 echo "▶ Smart inventory: locations invariant, transfers, branch stock, counts, decisions, permissions"
 step supabase/tests/inventory_test.sql
 
+echo "▶ Supplier accounts: opening, payments, advances, drawer, statement, aging, integrity, permissions"
+step supabase/tests/supplier_accounts_test.sql
+
 # آخر خطوة لأنها تُثبّت (commit) بياناتها في القاعدة المؤقتة
 echo "▶ Inventory concurrency: two real sessions racing on transfers, sales, scans"
 bash supabase/tests/inventory_concurrency.sh "$T"
