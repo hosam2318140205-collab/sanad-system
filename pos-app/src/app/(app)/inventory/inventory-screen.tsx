@@ -1,11 +1,12 @@
 "use client";
 
-import { ClipboardCheck, History, Search, SlidersHorizontal } from "lucide-react";
+import { Activity, ArrowLeftRight, ClipboardCheck, History, Search, SlidersHorizontal } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button, Card, EmptyState, Field, Input, Loading, Modal, PageHeader, Select, Stat, Table, useToast } from "@/components/ui";
 import { normalize } from "@/lib/catalog";
 import { errorMessage, money, num, variantLabel } from "@/lib/format";
+import { fetchLocations, newRef, rpcAll, type Availability, type Location } from "@/lib/inventory";
 import { supabase } from "@/lib/supabase/client";
 import type { Category } from "@/lib/types";
 
@@ -32,6 +33,9 @@ export function InventoryScreen() {
   const [cat, setCat] = useState("");
   const [filter, setFilter] = useState<"all" | "low" | "out" | "negative">("all");
   const [adjust, setAdjust] = useState<Row | null>(null);
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [loc, setLoc] = useState("");
+  const [avail, setAvail] = useState<Record<string, Availability> | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -62,19 +66,39 @@ export function InventoryScreen() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data load
     load();
+    fetchLocations()
+      .then(setLocations)
+      .catch(() => setLocations([]));
   }, [load]);
+
+  // عرض موقع محدد: الموجود / المحجوز / الصادر المعتمد / المتاح للبيع / القادم
+  const loadAvail = useCallback(async () => {
+    if (!loc) return setAvail(null);
+    try {
+      const list = await rpcAll<Availability>("location_availability", { p_location: loc });
+      setAvail(Object.fromEntries(list.map((a) => [a.variant_id, a])));
+    } catch (e) {
+      toast(errorMessage(e), "error");
+    }
+  }, [loc, toast]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reload on location change
+    loadAvail();
+  }, [loadAvail]);
+  const qtyOf = useCallback((r: Row) => (avail ? (avail[r.id]?.on_hand ?? 0) : r.stock_qty), [avail]);
 
   const filtered = useMemo(() => {
     const term = normalize(q);
     return rows.filter((r) => {
       if (cat && r.product.category_id !== cat) return false;
-      if (filter === "low" && r.stock_qty > r.low_stock_threshold) return false;
-      if (filter === "out" && r.stock_qty > 0) return false;
-      if (filter === "negative" && r.stock_qty >= 0) return false;
+      const qty = qtyOf(r);
+      if (filter === "low" && qty > r.low_stock_threshold) return false;
+      if (filter === "out" && qty > 0) return false;
+      if (filter === "negative" && qty >= 0) return false;
       if (!term) return true;
       return normalize(r.product.name).includes(term) || r.sku.toLowerCase().includes(term) || r.barcode?.includes(term);
     });
-  }, [rows, q, cat, filter]);
+  }, [rows, q, cat, filter, qtyOf]);
 
   const totals = useMemo(() => {
     let units = 0;
@@ -82,14 +106,15 @@ export function InventoryScreen() {
     let retail = 0;
     let low = 0;
     for (const r of rows) {
-      const qty = Math.max(r.stock_qty, 0);
+      const qty = Math.max(qtyOf(r), 0);
       units += qty;
       cost += qty * Number(r.cost?.cost_price ?? 0);
       retail += qty * Number(r.price ?? r.product.base_price);
-      if (r.stock_qty <= r.low_stock_threshold) low++;
+      if (qtyOf(r) <= r.low_stock_threshold) low++;
     }
     return { units, cost, retail, low };
-  }, [rows]);
+  }, [rows, qtyOf]);
+  const multi = locations.length > 1;
 
   return (
     <div className="p-4 md:p-6">
@@ -97,6 +122,28 @@ export function InventoryScreen() {
         title="المخزون"
         actions={
           <>
+            {multi && (
+              <Select aria-label="الموقع" className="w-auto min-w-40" value={loc} onChange={(e) => setLoc(e.target.value)}>
+                <option value="">كل المواقع (الإجمالي)</option>
+                {locations.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.name}
+                  </option>
+                ))}
+              </Select>
+            )}
+            {multi && (
+              <Link href="/transfers">
+                <Button variant="outline">
+                  <ArrowLeftRight className="size-4" /> التحويلات
+                </Button>
+              </Link>
+            )}
+            <Link href="/inventory/insights">
+              <Button variant="outline">
+                <Activity className="size-4" /> التحليلات
+              </Button>
+            </Link>
             <Link href="/inventory/movements">
               <Button variant="outline">
                 <History className="size-4" /> حركات المخزون
@@ -148,7 +195,12 @@ export function InventoryScreen() {
                 <th>المنتج</th>
                 <th>المقاس / اللون</th>
                 <th>SKU</th>
-                <th>الكمية</th>
+                <th>{avail ? "الموجود" : "الكمية"}</th>
+                {avail && <th>محجوز</th>}
+                {avail && <th>صادر معتمد</th>}
+                {avail && <th>المتاح للبيع</th>}
+                {avail && <th>قادم</th>}
+                {avail && <th>مطلوب من المورد</th>}
                 <th>التكلفة</th>
                 <th>القيمة</th>
                 <th></th>
@@ -165,10 +217,15 @@ export function InventoryScreen() {
                   <td>{variantLabel(r.size, r.color) || "-"}</td>
                   <td className="ltr-nums text-xs text-slate-500">{r.sku}</td>
                   <td>
-                    <Badge tone={r.stock_qty <= 0 ? "red" : r.stock_qty <= r.low_stock_threshold ? "amber" : "green"}>{r.stock_qty}</Badge>
+                    <Badge tone={qtyOf(r) <= 0 ? "red" : qtyOf(r) <= r.low_stock_threshold ? "amber" : "green"}>{qtyOf(r)}</Badge>
                   </td>
+                  {avail && <td>{avail[r.id]?.reserved || "-"}</td>}
+                  {avail && <td>{avail[r.id]?.outgoing || "-"}</td>}
+                  {avail && <td className="font-semibold">{avail[r.id]?.available ?? 0}</td>}
+                  {avail && <td>{(avail[r.id]?.in_transit ?? 0) + (avail[r.id]?.incoming_approved ?? 0) || "-"}</td>}
+                  {avail && <td>{avail[r.id]?.on_order || "-"}</td>}
                   <td>{money(r.cost?.cost_price ?? 0)}</td>
-                  <td>{money(Math.max(r.stock_qty, 0) * Number(r.cost?.cost_price ?? 0))}</td>
+                  <td>{money(Math.max(qtyOf(r), 0) * Number(r.cost?.cost_price ?? 0))}</td>
                   <td className="text-end">
                     <Button size="sm" variant="outline" onClick={() => setAdjust(r)}>
                       <SlidersHorizontal className="size-4" /> تسوية
@@ -185,10 +242,13 @@ export function InventoryScreen() {
       {adjust && (
         <AdjustModal
           row={adjust}
+          locations={locations}
+          defaultLocation={loc}
           onClose={() => setAdjust(null)}
-          onDone={(newQty) => {
-            setRows((rs) => rs.map((r) => (r.id === adjust.id ? { ...r, stock_qty: newQty } : r)));
+          onDone={(change) => {
+            setRows((rs) => rs.map((r) => (r.id === adjust.id ? { ...r, stock_qty: r.stock_qty + change } : r)));
             setAdjust(null);
+            loadAvail();
           }}
         />
       )}
@@ -198,29 +258,63 @@ export function InventoryScreen() {
 
 const REASONS = ["تالف", "مفقود / سرقة", "هدية / عينة", "تصحيح إدخال", "استلام بدون أمر شراء", "أخرى"];
 
-function AdjustModal({ row, onClose, onDone }: { row: Row; onClose: () => void; onDone: (qty: number) => void }) {
+function AdjustModal({
+  row,
+  locations,
+  defaultLocation,
+  onClose,
+  onDone,
+}: {
+  row: Row;
+  locations: Location[];
+  defaultLocation: string;
+  onClose: () => void;
+  onDone: (change: number) => void;
+}) {
   const toast = useToast();
+  const [location, setLocation] = useState(defaultLocation || locations.find((l) => l.is_default)?.id || "");
+  const [current, setCurrent] = useState<number | null>(null);
   const [mode, setMode] = useState<"add" | "remove" | "set">("remove");
   const [qty, setQty] = useState("");
   const [reason, setReason] = useState(REASONS[0]);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const ref = useRef(newRef());
 
+  // الرصيد الحالي في الموقع المختار (التسوية تكون دائماً على موقع)
+  useEffect(() => {
+    if (!location) return;
+    let alive = true;
+    supabase()
+      .from("location_stock")
+      .select("qty")
+      .eq("location_id", location)
+      .eq("variant_id", row.id)
+      .maybeSingle()
+      .then(({ data }) => alive && setCurrent(Number(data?.qty ?? 0)));
+    return () => {
+      alive = false;
+    };
+  }, [location, row.id]);
+
+  const base = current ?? 0;
   const n = Number(qty) || 0;
-  const change = mode === "add" ? n : mode === "remove" ? -n : n - row.stock_qty;
+  const change = mode === "add" ? n : mode === "remove" ? -n : n - base;
 
   const submit = async () => {
-    if (change === 0) return;
+    if (change === 0 || !location) return;
     setBusy(true);
-    const { data, error } = await supabase().rpc("adjust_stock", {
-      p_variant_id: row.id,
+    const { error } = await supabase().rpc("adjust_location_stock", {
+      p_location: location,
+      p_variant: row.id,
       p_qty_change: change,
       p_note: note ? `${reason}: ${note}` : reason,
+      p_client_ref: ref.current,
     });
     setBusy(false);
     if (error) return toast(errorMessage(error), "error");
     toast("تم تعديل المخزون");
-    onDone(data as number);
+    onDone(change);
   };
 
   return (
@@ -230,15 +324,26 @@ function AdjustModal({ row, onClose, onDone }: { row: Row; onClose: () => void; 
       title={`تسوية: ${row.product.name} ${variantLabel(row.size, row.color)}`}
       size="sm"
       footer={
-        <Button onClick={submit} loading={busy} disabled={change === 0}>
+        <Button onClick={submit} loading={busy} disabled={change === 0 || current === null}>
           حفظ ({change > 0 ? "+" : ""}
           {change})
         </Button>
       }
     >
       <div className="space-y-3">
+        {locations.length > 1 && (
+          <Field label="الموقع">
+            <Select aria-label="موقع التسوية" value={location} onChange={(e) => (setCurrent(null), setLocation(e.target.value))}>
+              {locations.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
         <p className="text-sm text-slate-600">
-          الكمية الحالية: <b>{row.stock_qty}</b> ← الجديدة: <b>{row.stock_qty + change}</b>
+          الكمية الحالية{locations.length > 1 ? " في الموقع" : ""}: <b>{current ?? "…"}</b> ← الجديدة: <b>{base + change}</b>
         </p>
         <Select value={mode} onChange={(e) => setMode(e.target.value as typeof mode)}>
           <option value="remove">خصم كمية</option>
@@ -254,6 +359,7 @@ function AdjustModal({ row, onClose, onDone }: { row: Row; onClose: () => void; 
           </Select>
         </Field>
         <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="ملاحظة (اختياري)" />
+        <p className="text-xs text-slate-500">لا يُسمح بأن يصبح رصيد الموقع سالباً. لنقل بضاعة بين المواقع استخدم التحويلات.</p>
       </div>
     </Modal>
   );

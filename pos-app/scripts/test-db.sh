@@ -37,4 +37,11 @@ step supabase/tests/advisor_test.sql
 echo "▶ Demo data: seed, remove, re-seed"
 step supabase/tests/demo_data_test.sql
 
+echo "▶ Smart inventory: locations invariant, transfers, branch stock, counts, decisions, permissions"
+step supabase/tests/inventory_test.sql
+
+# آخر خطوة لأنها تُثبّت (commit) بياناتها في القاعدة المؤقتة
+echo "▶ Inventory concurrency: two real sessions racing on transfers, sales, scans"
+bash supabase/tests/inventory_concurrency.sh "$T"
+
 echo "✓ Database tests passed"

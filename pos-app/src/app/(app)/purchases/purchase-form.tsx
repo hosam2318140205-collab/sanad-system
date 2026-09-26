@@ -8,6 +8,7 @@ import { useSession } from "@/components/session-context";
 import { Badge, Button, Card, ConfirmDialog, Field, Input, Loading, PageHeader, Select, Table, Textarea, useToast } from "@/components/ui";
 import { VariantSearch } from "@/components/variant-search";
 import { PURCHASE_STATUS_LABELS, dateTime, errorMessage, money, round2, variantLabel } from "@/lib/format";
+import { fetchLocations, type Location } from "@/lib/inventory";
 import { supabase } from "@/lib/supabase/client";
 import type { CatalogItem, PurchaseOrder, PurchaseStatus, Supplier } from "@/lib/types";
 
@@ -28,6 +29,8 @@ export function PurchaseForm({ id }: { id: string | null }) {
   const [po, setPo] = useState<PurchaseOrder | null>(null);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [supplierId, setSupplierId] = useState("");
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [locationId, setLocationId] = useState("");
   const [invoiceNo, setInvoiceNo] = useState("");
   const [notes, setNotes] = useState("");
   const [lines, setLines] = useState<Line[]>([]);
@@ -41,6 +44,13 @@ export function PurchaseForm({ id }: { id: string | null }) {
       .eq("is_active", true)
       .order("name")
       .then(({ data }) => setSuppliers((data ?? []) as Supplier[]));
+    // موقع الاستلام: يظهر فقط عند تعدد المواقع (وإلا يُستلم في الموقع الافتراضي)
+    fetchLocations()
+      .then((l) => {
+        setLocations(l);
+        if (!id) setLocationId((cur) => cur || (l.find((x) => x.is_default)?.id ?? ""));
+      })
+      .catch(() => setLocations([]));
     if (!id) return;
     (async () => {
       const [{ data: p }, { data: items }] = await Promise.all([
@@ -53,6 +63,7 @@ export function PurchaseForm({ id }: { id: string | null }) {
       const order = p as PurchaseOrder;
       setPo(order);
       setSupplierId(order.supplier_id);
+      setLocationId((order as PurchaseOrder & { location_id?: string | null }).location_id ?? "");
       setInvoiceNo(order.supplier_invoice_no ?? "");
       setNotes(order.notes ?? "");
       setLines(
@@ -112,7 +123,13 @@ export function PurchaseForm({ id }: { id: string | null }) {
     const db = supabase();
     try {
       let poId = id;
-      const header = { supplier_id: supplierId, supplier_invoice_no: invoiceNo.trim() || null, notes: notes.trim() || null, status };
+      const header = {
+        supplier_id: supplierId,
+        supplier_invoice_no: invoiceNo.trim() || null,
+        notes: notes.trim() || null,
+        status,
+        ...(locations.length > 1 && locationId ? { location_id: locationId } : {}),
+      };
       if (poId) {
         const { error } = await db.from("purchase_orders").update(header).eq("id", poId);
         if (error) throw error;
@@ -225,6 +242,17 @@ export function PurchaseForm({ id }: { id: string | null }) {
             <Link href="/suppliers" className="text-sm text-brand-700 hover:underline">
               أضف مورداً أولاً
             </Link>
+          )}
+          {locations.length > 1 && (
+            <Field label="موقع الاستلام">
+              <Select aria-label="موقع الاستلام" value={locationId} onChange={(e) => setLocationId(e.target.value)} disabled={!editable}>
+                {locations.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
           )}
           <Field label="رقم فاتورة المورد">
             <Input dir="ltr" value={invoiceNo} onChange={(e) => setInvoiceNo(e.target.value)} disabled={!editable} />
