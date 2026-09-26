@@ -367,6 +367,22 @@ do $$ declare v uuid; begin
   assert (select location_id from public.purchase_orders where id = v) = pg_temp.loc('BR2'), 'draft at branch';
 end $$;
 
+-- Regression: الكمية المطلوبة من المورد ولم تصل لا تُقترح للشراء مرة ثانية
+do $$ declare v uuid; begin
+  assert (select on_order from public.location_availability(pg_temp.loc('BR2')) where sku = 'SHO-43') = 8, 'open PO counted as on order';
+  assert not exists (select 1 from public.decision_center(7, 30, 7) where action = 'order' and sku = 'SHO-43'),
+    'no repeat purchase suggestion for quantity already on an open PO';
+  -- مسودة جزئية: 1 من 4 للبنطلون 32 ← يبقى اقتراح 3 فقط
+  v := public.create_purchase_draft_at('00000000-0000-0000-0000-00000000d001', pg_temp.loc('BR2'),
+         '[{"variant_id":"00000000-0000-0000-0000-00000000b007","qty":1}]');
+  assert (select qty from public.decision_center(7, 30, 7) where action = 'order' and sku = 'PN-32') = 3,
+    'partial open PO reduces the remaining purchase suggestion';
+  -- إلغاء أمر الشراء يعيد الاقتراح
+  update public.purchase_orders set status = 'cancelled' where id = v;
+  assert (select qty from public.decision_center(7, 30, 7) where action = 'order' and sku = 'PN-32') = 4,
+    'cancelled PO no longer counts';
+end $$;
+
 -- ============ 8) الصلاحيات ============
 select pg_temp.as_user('00000000-0000-0000-0000-0000000000f3');
 select pg_temp.expect_error($q$select * from public.decision_center()$q$, 'غير مصرح');

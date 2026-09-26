@@ -53,8 +53,9 @@ begin
                   add column surplus integer, add column rem_surplus integer;
   update _dc set target = ceil(avg_d * (p_lead_days + p_safety_days + p_cover_days))::integer,
                  rop = ceil(avg_d * (p_lead_days + p_safety_days))::integer;
-  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit + incoming_approved <= rop
-                             then greatest(target - (available + in_transit + incoming_approved), 0) else 0 end;
+  -- القادم = بالطريق + تحويل معتمد + مطلوب من المورد ولم يصل: لا يُقترح شراء أو نقل ما هو قادم أصلاً
+  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit + incoming_approved + on_order <= rop
+                             then greatest(target - (available + in_transit + incoming_approved + on_order), 0) else 0 end;
   update _dc set surplus = case
                    when need > 0 then 0
                    when avg_d > 0 then greatest(available - target, 0)
@@ -100,7 +101,7 @@ begin
                                      'sold_7', d.n7, 'sold_30', d.n30, 'sold_60', d.n60, 'sold_90', d.n90,
                                      'avg_daily', d.avg_d, 'target', d.target, 'surplus', d.surplus),
           'to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
-                                   'in_transit', r.in_transit + r.incoming_approved, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
+                                   'in_transit', r.in_transit + r.incoming_approved, 'on_order', r.on_order, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
                                    'sold_90', r.n90, 'avg_daily', r.avg_d, 'reorder_point', r.rop,
                                    'target', r.target, 'need', r.need),
           'qty', v_t));
@@ -114,14 +115,14 @@ begin
         r.variant_id, r.sku, r.product_name, r.label,
         null, null, r.location_id, r.location_name, v_remaining, r.unit_cost, r.unit_price,
         format('«%s» يبيع %s قطعة/يوم (باع %s خلال 30 يوماً)، والمتاح %s + القادم %s ≤ نقطة الطلب %s ← يحتاج %s. %s اشترِ %s.',
-               r.location_name, r.avg_d, r.n30, r.available, r.in_transit + r.incoming_approved, r.rop, r.need,
+               r.location_name, r.avg_d, r.n30, r.available, r.in_transit + r.incoming_approved + r.on_order, r.rop, r.need,
                case when v_moved > 0 then format('يُغطّى %s بالنقل (%s)، والمتبقي بلا فائض في المواقع الأخرى ←',
                                                   v_moved, array_to_string(v_parts, '، '))
                     when v_elsewhere > 0 then format('متوفر %s في مواقع أخرى لكنها تحتاجه لمبيعاتها ←', v_elsewhere)
                     else 'لا يوجد في أي موقع آخر ←' end,
                v_remaining),
         jsonb_build_object('to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
-                                                    'in_transit', r.in_transit + r.incoming_approved, 'sold_30', r.n30, 'sold_90', r.n90,
+                                                    'in_transit', r.in_transit + r.incoming_approved, 'on_order', r.on_order, 'sold_30', r.n30, 'sold_90', r.n90,
                                                     'avg_daily', r.avg_d, 'reorder_point', r.rop, 'target', r.target,
                                                     'need', r.need),
                            'covered_by_transfer', v_moved, 'available_elsewhere', v_elsewhere, 'qty', v_remaining));

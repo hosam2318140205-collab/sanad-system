@@ -81,6 +81,7 @@ export interface Availability {
   unit_cost: number;
   unit_price: number;
   age_days: number | null;
+  on_order: number;
 }
 
 export interface Decision {

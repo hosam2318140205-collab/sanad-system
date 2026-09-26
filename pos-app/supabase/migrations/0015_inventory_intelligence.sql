@@ -82,7 +82,7 @@ returns table (
   variant_id uuid, product_id uuid, product_name text, category_id uuid, sku text, barcode text,
   size text, color text, on_hand integer, reserved integer, outgoing integer, available integer, in_transit integer,
   incoming_approved integer, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
-  unit_cost numeric, unit_price numeric, age_days integer
+  unit_cost numeric, unit_price numeric, age_days integer, on_order integer
 )
 language plpgsql stable security definer set search_path = public as $$
 #variable_conflict use_column
@@ -112,6 +112,12 @@ begin
       from public.transfer_items i join public.transfers t on t.id = i.transfer_id
      where t.status in ('approved', 'in_transit') group by 1, 2
   ),
+  -- مطلوب من المورد ولم يصل (مسودة أو مرسل) — نفس تعريف مساعد الشراء، لموقع الاستلام
+  open_po as (
+    select coalesce(po.location_id, public._default_location()) as loc, pi.variant_id, sum(pi.qty)::integer as qty
+      from public.purchase_items pi join public.purchase_orders po on po.id = pi.purchase_id
+     where po.status in ('draft', 'ordered') group by 1, 2
+  ),
   sales as (select * from public._location_sales()),
   pairs as (
     select l.id as loc, v.id as variant_id
@@ -131,7 +137,8 @@ begin
          -- ولا يكون العمر أقصر من أول بيع مسجل في الموقع
          greatest(ceil(extract(epoch from now() - least(
            greatest(v.created_at, case when l.is_default then v.created_at else l.created_at end),
-           coalesce(sa.first_sale_at, 'infinity'::timestamptz))) / 86400), 1)::integer
+           coalesce(sa.first_sale_at, 'infinity'::timestamptz))) / 86400), 1)::integer,
+         coalesce(po.qty, 0)
     from pairs pr
     join locs l on l.id = pr.loc
     join public.product_variants v on v.id = pr.variant_id
@@ -142,6 +149,7 @@ begin
     left join incoming inc on inc.loc = l.id and inc.variant_id = v.id
     left join incoming_appr ia on ia.loc = l.id and ia.variant_id = v.id
     left join sales sa on sa.location_id = l.id and sa.variant_id = v.id
+    left join open_po po on po.loc = l.id and po.variant_id = v.id
     left join public.variant_costs vc on vc.variant_id = v.id;
 end;
 $$;

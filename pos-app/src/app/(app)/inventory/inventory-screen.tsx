@@ -200,6 +200,7 @@ export function InventoryScreen() {
                 {avail && <th>صادر معتمد</th>}
                 {avail && <th>المتاح للبيع</th>}
                 {avail && <th>قادم</th>}
+                {avail && <th>مطلوب من المورد</th>}
                 <th>التكلفة</th>
                 <th>القيمة</th>
                 <th></th>
@@ -222,6 +223,7 @@ export function InventoryScreen() {
                   {avail && <td>{avail[r.id]?.outgoing || "-"}</td>}
                   {avail && <td className="font-semibold">{avail[r.id]?.available ?? 0}</td>}
                   {avail && <td>{(avail[r.id]?.in_transit ?? 0) + (avail[r.id]?.incoming_approved ?? 0) || "-"}</td>}
+                  {avail && <td>{avail[r.id]?.on_order || "-"}</td>}
                   <td>{money(r.cost?.cost_price ?? 0)}</td>
                   <td>{money(Math.max(qtyOf(r), 0) * Number(r.cost?.cost_price ?? 0))}</td>
                   <td className="text-end">

@@ -3807,7 +3807,7 @@ returns table (
   variant_id uuid, product_id uuid, product_name text, category_id uuid, sku text, barcode text,
   size text, color text, on_hand integer, reserved integer, outgoing integer, available integer, in_transit integer,
   incoming_approved integer, n7 integer, n30 integer, n60 integer, n90 integer, last_sale_at timestamptz,
-  unit_cost numeric, unit_price numeric, age_days integer
+  unit_cost numeric, unit_price numeric, age_days integer, on_order integer
 )
 language plpgsql stable security definer set search_path = public as $$
 #variable_conflict use_column
@@ -3837,6 +3837,12 @@ begin
       from public.transfer_items i join public.transfers t on t.id = i.transfer_id
      where t.status in ('approved', 'in_transit') group by 1, 2
   ),
+  -- مطلوب من المورد ولم يصل (مسودة أو مرسل) — نفس تعريف مساعد الشراء، لموقع الاستلام
+  open_po as (
+    select coalesce(po.location_id, public._default_location()) as loc, pi.variant_id, sum(pi.qty)::integer as qty
+      from public.purchase_items pi join public.purchase_orders po on po.id = pi.purchase_id
+     where po.status in ('draft', 'ordered') group by 1, 2
+  ),
   sales as (select * from public._location_sales()),
   pairs as (
     select l.id as loc, v.id as variant_id
@@ -3856,7 +3862,8 @@ begin
          -- ولا يكون العمر أقصر من أول بيع مسجل في الموقع
          greatest(ceil(extract(epoch from now() - least(
            greatest(v.created_at, case when l.is_default then v.created_at else l.created_at end),
-           coalesce(sa.first_sale_at, 'infinity'::timestamptz))) / 86400), 1)::integer
+           coalesce(sa.first_sale_at, 'infinity'::timestamptz))) / 86400), 1)::integer,
+         coalesce(po.qty, 0)
     from pairs pr
     join locs l on l.id = pr.loc
     join public.product_variants v on v.id = pr.variant_id
@@ -3867,6 +3874,7 @@ begin
     left join incoming inc on inc.loc = l.id and inc.variant_id = v.id
     left join incoming_appr ia on ia.loc = l.id and ia.variant_id = v.id
     left join sales sa on sa.location_id = l.id and sa.variant_id = v.id
+    left join open_po po on po.loc = l.id and po.variant_id = v.id
     left join public.variant_costs vc on vc.variant_id = v.id;
 end;
 $$;
@@ -4224,8 +4232,9 @@ begin
                   add column surplus integer, add column rem_surplus integer;
   update _dc set target = ceil(avg_d * (p_lead_days + p_safety_days + p_cover_days))::integer,
                  rop = ceil(avg_d * (p_lead_days + p_safety_days))::integer;
-  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit + incoming_approved <= rop
-                             then greatest(target - (available + in_transit + incoming_approved), 0) else 0 end;
+  -- القادم = بالطريق + تحويل معتمد + مطلوب من المورد ولم يصل: لا يُقترح شراء أو نقل ما هو قادم أصلاً
+  update _dc set need = case when location_kind = 'store' and avg_d > 0 and available + in_transit + incoming_approved + on_order <= rop
+                             then greatest(target - (available + in_transit + incoming_approved + on_order), 0) else 0 end;
   update _dc set surplus = case
                    when need > 0 then 0
                    when avg_d > 0 then greatest(available - target, 0)
@@ -4271,7 +4280,7 @@ begin
                                      'sold_7', d.n7, 'sold_30', d.n30, 'sold_60', d.n60, 'sold_90', d.n90,
                                      'avg_daily', d.avg_d, 'target', d.target, 'surplus', d.surplus),
           'to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
-                                   'in_transit', r.in_transit + r.incoming_approved, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
+                                   'in_transit', r.in_transit + r.incoming_approved, 'on_order', r.on_order, 'sold_7', r.n7, 'sold_30', r.n30, 'sold_60', r.n60,
                                    'sold_90', r.n90, 'avg_daily', r.avg_d, 'reorder_point', r.rop,
                                    'target', r.target, 'need', r.need),
           'qty', v_t));
@@ -4285,14 +4294,14 @@ begin
         r.variant_id, r.sku, r.product_name, r.label,
         null, null, r.location_id, r.location_name, v_remaining, r.unit_cost, r.unit_price,
         format('«%s» يبيع %s قطعة/يوم (باع %s خلال 30 يوماً)، والمتاح %s + القادم %s ≤ نقطة الطلب %s ← يحتاج %s. %s اشترِ %s.',
-               r.location_name, r.avg_d, r.n30, r.available, r.in_transit + r.incoming_approved, r.rop, r.need,
+               r.location_name, r.avg_d, r.n30, r.available, r.in_transit + r.incoming_approved + r.on_order, r.rop, r.need,
                case when v_moved > 0 then format('يُغطّى %s بالنقل (%s)، والمتبقي بلا فائض في المواقع الأخرى ←',
                                                   v_moved, array_to_string(v_parts, '، '))
                     when v_elsewhere > 0 then format('متوفر %s في مواقع أخرى لكنها تحتاجه لمبيعاتها ←', v_elsewhere)
                     else 'لا يوجد في أي موقع آخر ←' end,
                v_remaining),
         jsonb_build_object('to', jsonb_build_object('name', r.location_name, 'on_hand', r.on_hand, 'available', r.available,
-                                                    'in_transit', r.in_transit + r.incoming_approved, 'sold_30', r.n30, 'sold_90', r.n90,
+                                                    'in_transit', r.in_transit + r.incoming_approved, 'on_order', r.on_order, 'sold_30', r.n30, 'sold_90', r.n90,
                                                     'avg_daily', r.avg_d, 'reorder_point', r.rop, 'target', r.target,
                                                     'need', r.need),
                            'covered_by_transfer', v_moved, 'available_elsewhere', v_elsewhere, 'qty', v_remaining));
