@@ -49,8 +49,14 @@ step supabase/tests/purchase_documents_test.sql
 echo "▶ Supplier returns, credit notes, refunds, landed cost"
 step supabase/tests/supplier_returns_test.sql
 
+echo "▶ Supplier intelligence: landed cost, lead time, fill rate, scoring, why, drafts by supplier, dashboard"
+step supabase/tests/supplier_intel_test.sql
+
 # آخر خطوة لأنها تُثبّت (commit) بياناتها في القاعدة المؤقتة
 echo "▶ Inventory concurrency: two real sessions racing on transfers, sales, scans"
 bash supabase/tests/inventory_concurrency.sh "$T"
+
+echo "▶ Suppliers concurrency: payments, receipts, invoice posting, return vs sale"
+bash supabase/tests/suppliers_concurrency.sh "$T"
 
 echo "✓ Database tests passed"

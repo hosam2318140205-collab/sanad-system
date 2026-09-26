@@ -369,6 +369,8 @@ begin
 
   perform set_config('app.po_rpc', 'on', true);
   for it in select * from public.supplier_return_items where return_id = p_id order by variant_id, id loop
+    -- نفس ترتيب أقفال البيع (الصنف ثم رصيد الموقع) حتى لا يحدث تعارض قفل متبادل
+    perform 1 from public.product_variants where id = it.variant_id for update;
     select coalesce(qty, 0) into v_have from public.location_stock
      where location_id = r.location_id and variant_id = it.variant_id for update;
     if coalesce(v_have, 0) < it.qty then
