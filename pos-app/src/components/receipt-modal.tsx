@@ -7,6 +7,7 @@ import { PrintPortal } from "./print-portal";
 import { Receipt, type ReceiptData } from "./receipt";
 import { useSession } from "./session-context";
 import { Button, Modal } from "./ui";
+import { WhatsAppReceiptButton } from "./whatsapp-share";
 
 export function ReceiptModal({
   data,
@@ -41,6 +42,7 @@ export function ReceiptModal({
               <option value="58">ورق 58mm</option>
             </select>
             {extraActions}
+            {data.sale.public_token && <WhatsAppReceiptButton data={data} />}
             <Button onClick={printNow} autoFocus>
               <Printer className="size-4" /> طباعة
             </Button>
