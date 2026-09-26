@@ -91,6 +91,7 @@ export const MOVEMENT_LABELS: Record<MovementType, string> = {
   purchase: "مشتريات",
   adjustment: "تسوية",
   count: "جرد",
+  supplier_return: "مرتجع للمورد",
 };
 
 /** Extract a readable message from Supabase / unknown errors. */

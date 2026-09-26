@@ -3,7 +3,7 @@ export type PaymentMethod = "cash" | "card" | "transfer" | "exchange_credit";
 export type RefundMethod = "cash" | "card" | "transfer" | "exchange";
 export type SaleStatus = "completed" | "partially_returned" | "returned";
 export type PurchaseStatus = "draft" | "ordered" | "received" | "cancelled";
-export type MovementType = "opening" | "sale" | "return" | "purchase" | "adjustment" | "count";
+export type MovementType = "opening" | "sale" | "return" | "purchase" | "adjustment" | "count" | "supplier_return";
 export type CountStatus = "open" | "submitted" | "applied" | "cancelled";
 
 export interface Profile {

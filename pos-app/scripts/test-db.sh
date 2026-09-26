@@ -46,6 +46,9 @@ step supabase/tests/supplier_accounts_test.sql
 echo "▶ Purchase documents: partial receipts, 3-way match, invoice posting, cost variance, legacy compatibility"
 step supabase/tests/purchase_documents_test.sql
 
+echo "▶ Supplier returns, credit notes, refunds, landed cost"
+step supabase/tests/supplier_returns_test.sql
+
 # آخر خطوة لأنها تُثبّت (commit) بياناتها في القاعدة المؤقتة
 echo "▶ Inventory concurrency: two real sessions racing on transfers, sales, scans"
 bash supabase/tests/inventory_concurrency.sh "$T"
