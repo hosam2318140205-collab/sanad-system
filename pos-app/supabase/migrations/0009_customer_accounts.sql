@@ -11,7 +11,7 @@
 alter type public.payment_method add value if not exists 'on_account';
 alter type public.refund_method add value if not exists 'account';
 
-create type public.ar_entry_type as enum ('sale', 'return', 'receipt', 'refund', 'void', 'adjust');
+--create type public.ar_entry_type as enum ('sale', 'return', 'receipt', 'refund', 'void', 'adjust');
 create type public.loyalty_entry_type as enum ('earn', 'redeem', 'return_reverse', 'return_restore', 'adjust');
 create type public.collection_method as enum ('cash_drawer', 'cash', 'card', 'transfer');
 create type public.collection_kind as enum ('receipt', 'refund');
