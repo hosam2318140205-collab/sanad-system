@@ -75,6 +75,16 @@ language sql stable security definer set search_path = public as $$
     from agg a full join last_sale l on l.loc = a.loc and l.variant_id = a.variant_id
 $$;
 
+-- مطلوب من المورد ولم يصل (مسودة أو مرسل) — نفس تعريف مساعد الشراء، لموقع الاستلام.
+-- دالة مستقلة حتى تستبدلها ترقية المشتريات (الاستلام الجزئي) دون إعادة تعريف دوال التوفر
+create or replace function public._open_po_qty()
+returns table (loc uuid, variant_id uuid, qty integer)
+language sql stable security definer set search_path = public as $$
+  select coalesce(po.location_id, public._default_location()), pi.variant_id, sum(pi.qty)::integer
+    from public.purchase_items pi join public.purchase_orders po on po.id = pi.purchase_id
+   where po.status in ('draft', 'ordered') group by 1, 2
+$$;
+
 -- لكل موقع (متجر/مستودع) وصنف: الكميات الخمس + المبيعات + التكلفة والسعر
 create or replace function public.location_availability(p_location uuid default null)
 returns table (
@@ -112,12 +122,7 @@ begin
       from public.transfer_items i join public.transfers t on t.id = i.transfer_id
      where t.status in ('approved', 'in_transit') group by 1, 2
   ),
-  -- مطلوب من المورد ولم يصل (مسودة أو مرسل) — نفس تعريف مساعد الشراء، لموقع الاستلام
-  open_po as (
-    select coalesce(po.location_id, public._default_location()) as loc, pi.variant_id, sum(pi.qty)::integer as qty
-      from public.purchase_items pi join public.purchase_orders po on po.id = pi.purchase_id
-     where po.status in ('draft', 'ordered') group by 1, 2
-  ),
+  open_po as (select * from public._open_po_qty()),
   sales as (select * from public._location_sales()),
   pairs as (
     select l.id as loc, v.id as variant_id
@@ -439,7 +444,7 @@ begin
 end;
 $$;
 
-revoke all on function public._reserved_map(), public._location_sales() from public, anon, authenticated;
+revoke all on function public._reserved_map(), public._location_sales(), public._open_po_qty() from public, anon, authenticated;
 revoke execute on function
   public.location_availability(uuid), public.pos_location_context(), public.variant_locations(uuid),
   public.size_color_gaps(uuid), public.inventory_anomalies(), public.dead_stock_plan(uuid)
