@@ -75,13 +75,18 @@ supabase/
     0014_smart_counts.sql      جرد لكل موقع: مسح بمفتاح فريد، لقطة + حركات بعدها، اعتماد المدير
     0015_inventory_intelligence.sql  المتاح للبيع، المقاسات الناقصة، الشاذ، الراكد
     0016_decision_center.sql   مركز القرارات: انقل قبل أن تشتري، مع «لماذا؟» بالأرقام
+    0017_supplier_accounts.sql  حسابات الموردين: الدفتر، الدفعات والمقدمات، الكشف، أعمار الديون
+    0018_purchase_documents.sql  الاستلام الجزئي، فواتير المورد، المطابقة الثلاثية، فرق التكلفة، المرفقات
+    0019_supplier_returns_landed_cost.sql  المرتجعات للمورد، الإشعارات الدائنة، الاسترداد، تكاليف الوصول
+    0020_supplier_intelligence.sql  تاريخ الأسعار، تقييم المورد واقتراحه «لماذا؟»، لوحة المستحقات
   setup/                     ما يُنفَّذ في SQL Editor على Production
     01_all_migrations.sql    كل الـ migrations في ملف واحد (مولَّد — لا يُعدَّل يدوياً)
     02_demo_data.sql         بيانات تجريبية معلَّمة (DEMO-) — اختياري
     03_remove_demo_data.sql  حذف البيانات التجريبية فقط
     04_reset_test_transactions.sql  تصفير فواتير التجربة قبل الافتتاح (يتطلب تأكيداً)
     upgrades/                ترقيات لمشروع قائم: ملف لكل migration جديدة (مولَّد)
-  tests/                     smoke, shifts, expenses, advisor, demo_data, inventory_test.sql, inventory_concurrency.sh, supabase_stub.sql
+  tests/                     smoke, shifts, expenses, advisor, demo_data, inventory, supplier_accounts, purchase_documents,
+                             supplier_returns, supplier_intel, *_concurrency.sh, supabase_stub.sql
 scripts/                     bundle-migrations, check-bundle-secrets, test-db
 src/
   proxy.ts                   تحديث جلسة Supabase وحماية المسارات (Next 16 proxy)

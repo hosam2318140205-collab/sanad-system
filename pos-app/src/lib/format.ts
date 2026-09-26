@@ -80,7 +80,9 @@ export const SALE_STATUS_LABELS: Record<SaleStatus, string> = {
 export const PURCHASE_STATUS_LABELS: Record<PurchaseStatus, string> = {
   draft: "مسودة",
   ordered: "مطلوب",
+  partially_received: "مستلم جزئياً",
   received: "مستلم",
+  closed: "مغلق (أُلغي المتبقي)",
   cancelled: "ملغي",
 };
 
@@ -91,6 +93,7 @@ export const MOVEMENT_LABELS: Record<MovementType, string> = {
   purchase: "مشتريات",
   adjustment: "تسوية",
   count: "جرد",
+  supplier_return: "مرتجع للمورد",
 };
 
 /** Extract a readable message from Supabase / unknown errors. */

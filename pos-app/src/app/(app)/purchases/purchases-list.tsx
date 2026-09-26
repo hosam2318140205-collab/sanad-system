@@ -1,6 +1,6 @@
 "use client";
 
-import { Plus } from "lucide-react";
+import { FileText, Plus, Ship, Wallet } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Badge, Button, Card, EmptyState, Loading, PageHeader, Select, Table } from "@/components/ui";
@@ -13,7 +13,9 @@ type Row = PurchaseOrder & { supplier: { name: string } | null };
 const TONES: Record<PurchaseStatus, "slate" | "blue" | "green" | "red"> = {
   draft: "slate",
   ordered: "blue",
+  partially_received: "blue",
   received: "green",
+  closed: "slate",
   cancelled: "red",
 };
 
@@ -35,13 +37,30 @@ export function PurchasesList() {
     <div className="p-4 md:p-6">
       <PageHeader
         title="المشتريات"
-        subtitle="أوامر الشراء واستلام البضاعة من الموردين"
+        subtitle="أوامر الشراء، الاستلام الجزئي، وفواتير الموردين"
         actions={
-          <Link href="/purchases/new">
-            <Button>
-              <Plus className="size-4" /> أمر شراء جديد
-            </Button>
-          </Link>
+          <>
+            <Link href="/payables">
+              <Button variant="outline">
+                <Wallet className="size-4" /> المستحقات
+              </Button>
+            </Link>
+            <Link href="/purchases/invoices">
+              <Button variant="outline">
+                <FileText className="size-4" /> فواتير الموردين
+              </Button>
+            </Link>
+            <Link href="/purchases/landed-cost">
+              <Button variant="outline">
+                <Ship className="size-4" /> تكاليف الوصول
+              </Button>
+            </Link>
+            <Link href="/purchases/new">
+              <Button>
+                <Plus className="size-4" /> أمر شراء جديد
+              </Button>
+            </Link>
+          </>
         }
       />
       <Card>

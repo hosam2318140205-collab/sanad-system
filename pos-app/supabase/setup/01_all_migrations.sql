@@ -1,6 +1,6 @@
 -- ملف مُولَّد تلقائياً من supabase/migrations — لا تعدّله يدوياً (npm run db:bundle)
 -- نفّذه مرة واحدة فقط على مشروع Supabase جديد، في SQL Editor.
--- يحتوي: 0001_schema.sql, 0002_triggers_audit.sql, 0003_rls.sql, 0004_functions.sql, 0005_storage_limits.sql, 0006_shifts.sql, 0007_expenses.sql, 0008_purchase_advisor.sql, 0013_locations_transfers.sql, 0014_smart_counts.sql, 0015_inventory_intelligence.sql, 0016_decision_center.sql
+-- يحتوي: 0001_schema.sql, 0002_triggers_audit.sql, 0003_rls.sql, 0004_functions.sql, 0005_storage_limits.sql, 0006_shifts.sql, 0007_expenses.sql, 0008_purchase_advisor.sql, 0013_locations_transfers.sql, 0014_smart_counts.sql, 0015_inventory_intelligence.sql, 0016_decision_center.sql, 0017_supplier_accounts.sql, 0018_purchase_documents.sql, 0019_supplier_returns_landed_cost.sql, 0020_supplier_intelligence.sql
 
 begin;
 
@@ -4414,6 +4414,2989 @@ grant execute on function
   public.decision_center(integer, integer, integer),
   public.create_transfers_from_decisions(jsonb, text, uuid, boolean),
   public.create_purchase_draft_at(uuid, uuid, jsonb, text)
+to authenticated;
+
+-- =====================================================================
+-- 0017_supplier_accounts.sql
+-- =====================================================================
+-- =====================================================================
+-- 0017 حسابات الموردين (PR #9 — المرحلة 1)
+--   • مستندات مستحقة (supplier_invoices): رصيد افتتاحي / فاتورة شراء / فاتورة مصروف (شحن، جمارك…)
+--     هنا الرأس المالي فقط؛ بنود الشراء والمطابقة الثلاثية في 0018
+--   • دفعات الموردين (نقد/درج الوردية/تحويل/شبكة/شيك) وتوزيعها على الفواتير؛ غير الموزّع = دفعة مقدمة
+--   • دفتر المورد: إلحاق فقط، قيد واحد لكل مستند (unique entry_type + source_id)، ورصيد مجمّع يُطابق الدفتر
+--     الرصيد = ما علينا للمورد (دائن يزيده، مدين ينقصه). السالب = دفعة مقدمة لدى المورد
+--   • كشف حساب برصيد تراكمي، وأعمار الديون حسب الاستحقاق
+--   • كل الكتابة عبر دوال بصلاحية ومفتاح منع تكرار؛ لا كتابة مباشرة على الجداول المالية
+--   • لا يغيّر أي جدول قائم سوى أعمدة إضافية في suppliers (الكتابة القديمة على الموردين وأوامر الشراء تبقى كما هي)
+-- =====================================================================
+
+create type public.ap_entry_type as enum (
+  'opening', 'invoice', 'payment', 'credit_note', 'refund', 'void_invoice', 'void_payment', 'void_credit_note');
+create type public.ap_invoice_kind as enum ('opening', 'purchase', 'expense');
+create type public.ap_invoice_status as enum ('draft', 'posted', 'partially_paid', 'paid', 'void');
+create type public.ap_payment_terms as enum ('cash', 'credit', 'partial');
+create type public.ap_payment_method as enum ('cash_drawer', 'cash', 'bank_transfer', 'card', 'cheque', 'opening');
+
+-- ---------------------------------------------------------------------
+-- بيانات المورد الإضافية
+-- ---------------------------------------------------------------------
+alter table public.suppliers
+  add column code text,
+  add column payment_terms_days integer not null default 0 check (payment_terms_days between 0 and 365),
+  add column credit_limit numeric(12,2) check (credit_limit is null or credit_limit >= 0),
+  add column iban text,
+  add column vat_registered boolean not null default true,
+  add column lead_time_days integer check (lead_time_days is null or lead_time_days between 0 and 365);
+create unique index suppliers_code_key on public.suppliers (upper(code)) where code is not null;
+
+-- ---------------------------------------------------------------------
+-- المستندات المستحقة
+-- ---------------------------------------------------------------------
+create sequence public.supplier_invoice_seq start 1;
+create sequence public.supplier_payment_seq start 1;
+
+create table public.supplier_invoices (
+  id uuid primary key default gen_random_uuid(),
+  doc_no text not null unique
+    default 'SIN-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.supplier_invoice_seq')::text, 5, '0'),
+  supplier_id uuid not null references public.suppliers (id),
+  kind public.ap_invoice_kind not null default 'purchase',
+  status public.ap_invoice_status not null default 'draft',
+  supplier_invoice_no text,
+  invoice_date date not null default (now() at time zone 'Asia/Riyadh')::date,
+  due_date date,
+  payment_terms public.ap_payment_terms not null default 'credit',
+  subtotal numeric(12,2) not null default 0 check (subtotal >= 0),
+  vat_amount numeric(12,2) not null default 0 check (vat_amount >= 0),
+  total numeric(12,2) not null default 0 check (total >= 0),
+  settled_amount numeric(12,2) not null default 0 check (settled_amount >= 0),   -- من التوزيعات فقط
+  notes text,
+  client_ref uuid unique,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  posted_by uuid references public.profiles (id),
+  posted_at timestamptz,
+  voided_by uuid references public.profiles (id),
+  voided_at timestamptz,
+  void_reason text,
+  updated_at timestamptz not null default now(),
+  constraint supplier_invoice_settled_le_total check (settled_amount <= total)
+);
+create index supplier_invoices_supplier_idx on public.supplier_invoices (supplier_id, status, due_date);
+-- رقم فاتورة المورد لا يتكرر لنفس المورد (بعد إزالة المسافات وتوحيد الحروف)، إلا بعد إلغاء الأولى
+create unique index supplier_invoices_no_key on public.supplier_invoices
+  (supplier_id, lower(regexp_replace(supplier_invoice_no, '\s', '', 'g')))
+  where supplier_invoice_no is not null and status <> 'void';
+
+create table public.supplier_payments (
+  id uuid primary key default gen_random_uuid(),
+  payment_no text not null unique
+    default 'SPY-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.supplier_payment_seq')::text, 5, '0'),
+  supplier_id uuid not null references public.suppliers (id),
+  amount numeric(12,2) not null check (amount > 0),
+  method public.ap_payment_method not null,
+  reference text,
+  paid_at date not null default (now() at time zone 'Asia/Riyadh')::date,
+  shift_id uuid references public.shifts (id),
+  shift_movement_id uuid references public.shift_cash_movements (id),
+  allocated_amount numeric(12,2) not null default 0 check (allocated_amount >= 0),
+  notes text,
+  client_ref uuid unique,
+  is_void boolean not null default false,
+  void_reason text,
+  voided_by uuid references public.profiles (id),
+  voided_at timestamptz,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  constraint supplier_payment_alloc_le_amount check (allocated_amount <= amount)
+);
+create index supplier_payments_supplier_idx on public.supplier_payments (supplier_id, paid_at);
+
+-- توزيع الدفعات (والإشعارات الدائنة في 0019) على الفواتير. الإلغاء يعلّم التوزيع ولا يحذفه
+create table public.supplier_allocations (
+  id bigint generated always as identity primary key,
+  supplier_id uuid not null references public.suppliers (id),
+  source_type text not null check (source_type in ('payment', 'credit_note')),
+  source_id uuid not null,
+  invoice_id uuid not null references public.supplier_invoices (id),
+  amount numeric(12,2) not null check (amount > 0),
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  voided_at timestamptz
+);
+create index supplier_allocations_invoice_idx on public.supplier_allocations (invoice_id) where voided_at is null;
+create index supplier_allocations_source_idx on public.supplier_allocations (source_type, source_id) where voided_at is null;
+
+-- ---------------------------------------------------------------------
+-- الدفتر والرصيد
+-- ---------------------------------------------------------------------
+create table public.supplier_ledger (
+  id bigint generated always as identity primary key,
+  supplier_id uuid not null references public.suppliers (id) on delete restrict,
+  entry_type public.ap_entry_type not null,
+  source_id uuid not null,
+  ref_no text,
+  entry_date date not null default (now() at time zone 'Asia/Riyadh')::date,
+  debit numeric(12,2) not null default 0 check (debit >= 0),     -- ينقص ما علينا (دفعة، إشعار دائن)
+  credit numeric(12,2) not null default 0 check (credit >= 0),   -- يزيد ما علينا (فاتورة، رصيد افتتاحي)
+  balance_after numeric(12,2) not null,
+  note text,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default clock_timestamp(),
+  constraint supplier_ledger_one_side check ((debit > 0) <> (credit > 0)),
+  constraint supplier_ledger_unique_source unique (entry_type, source_id)
+);
+create index supplier_ledger_supplier_idx on public.supplier_ledger (supplier_id, id);
+
+create table public.supplier_balances (
+  supplier_id uuid primary key references public.suppliers (id) on delete restrict,
+  balance numeric(12,2) not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+create trigger supplier_invoices_touch before update on public.supplier_invoices
+  for each row execute function public.touch_updated_at();
+
+-- قيد يُفحص عند نهاية المعاملة: الرصيد = الدفتر، والمسدَّد = التوزيعات، والموزَّع من الدفعة = توزيعاتها
+create or replace function public._check_supplier_integrity(p_supplier uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_bal numeric;
+  v_led numeric;
+  r record;
+begin
+  select coalesce((select balance from public.supplier_balances where supplier_id = p_supplier), 0) into v_bal;
+  select coalesce(sum(credit - debit), 0) into v_led from public.supplier_ledger where supplier_id = p_supplier;
+  if v_bal <> v_led then
+    raise exception 'تعارض حساب المورد: الرصيد % والدفتر %', v_bal, v_led;
+  end if;
+  for r in
+    select i.doc_no, i.settled_amount,
+           coalesce((select sum(a.amount) from public.supplier_allocations a where a.invoice_id = i.id and a.voided_at is null), 0) as alloc
+      from public.supplier_invoices i where i.supplier_id = p_supplier
+  loop
+    if r.settled_amount <> r.alloc then
+      raise exception 'تعارض المسدَّد للفاتورة %: % مقابل توزيعات %', r.doc_no, r.settled_amount, r.alloc;
+    end if;
+  end loop;
+  for r in
+    select p.payment_no, p.allocated_amount,
+           coalesce((select sum(a.amount) from public.supplier_allocations a
+                      where a.source_type = 'payment' and a.source_id = p.id and a.voided_at is null), 0) as alloc
+      from public.supplier_payments p where p.supplier_id = p_supplier
+  loop
+    if r.allocated_amount <> r.alloc then
+      raise exception 'تعارض توزيع الدفعة %: % مقابل %', r.payment_no, r.allocated_amount, r.alloc;
+    end if;
+  end loop;
+end;
+$$;
+
+create or replace function public.supplier_integrity_trigger()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  perform public._check_supplier_integrity(coalesce(new.supplier_id, old.supplier_id));
+  return null;
+end;
+$$;
+create constraint trigger supplier_ledger_integrity after insert on public.supplier_ledger
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+create constraint trigger supplier_balances_integrity after insert or update on public.supplier_balances
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+create constraint trigger supplier_allocations_integrity after insert or update on public.supplier_allocations
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+create constraint trigger supplier_invoices_integrity after update of settled_amount on public.supplier_invoices
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+create constraint trigger supplier_payments_integrity after update of allocated_amount on public.supplier_payments
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+
+-- قيد في الدفتر + تحديث الرصيد (داخلي). قفل صف الرصيد يرتّب القيود المتزامنة لنفس المورد
+create or replace function public._ap_post(
+  p_supplier uuid, p_type public.ap_entry_type, p_source uuid, p_ref text,
+  p_debit numeric, p_credit numeric, p_note text default null, p_date date default null
+) returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  v_bal numeric;
+begin
+  insert into public.supplier_balances (supplier_id) values (p_supplier) on conflict (supplier_id) do nothing;
+  select balance into v_bal from public.supplier_balances where supplier_id = p_supplier for update;
+  v_bal := v_bal + coalesce(p_credit, 0) - coalesce(p_debit, 0);
+  insert into public.supplier_ledger (supplier_id, entry_type, source_id, ref_no, entry_date, debit, credit, balance_after, note)
+  values (p_supplier, p_type, p_source, p_ref, coalesce(p_date, (now() at time zone 'Asia/Riyadh')::date),
+          coalesce(p_debit, 0), coalesce(p_credit, 0), v_bal, p_note);
+  update public.supplier_balances set balance = v_bal, updated_at = now() where supplier_id = p_supplier;
+  return v_bal;
+end;
+$$;
+
+-- قفل المورد: كل عملية مالية على مورد تبدأ به (ترتيب أقفال ثابت: المورد ثم المستند)
+create or replace function public._lock_supplier(p_supplier uuid)
+returns public.suppliers language plpgsql security definer set search_path = public as $$
+declare
+  s public.suppliers;
+begin
+  select * into s from public.suppliers where id = p_supplier for update;
+  if s.id is null then
+    raise exception 'المورد غير موجود';
+  end if;
+  return s;
+end;
+$$;
+
+create or replace function public._invoice_refresh_status(p_id uuid)
+returns public.ap_invoice_status language plpgsql security definer set search_path = public as $$
+declare
+  i public.supplier_invoices;
+  v public.ap_invoice_status;
+begin
+  select * into i from public.supplier_invoices where id = p_id;
+  if i.status in ('draft', 'void') then
+    return i.status;
+  end if;
+  v := case when i.settled_amount >= i.total then 'paid'
+            when i.settled_amount > 0 then 'partially_paid' else 'posted' end;
+  update public.supplier_invoices set status = v where id = p_id and status <> v;
+  return v;
+end;
+$$;
+
+-- توزيع مبلغ من مصدر (دفعة/إشعار دائن) على الفواتير المفتوحة: صريح أو الأقدم استحقاقاً أولاً
+create or replace function public._ap_allocate(
+  p_supplier uuid, p_source_type text, p_source uuid, p_available numeric, p_allocations jsonb
+) returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  v_left numeric := p_available;
+  v_used numeric := 0;
+  v_amt numeric;
+  r record;
+begin
+  if p_available <= 0 then
+    return 0;
+  end if;
+  if p_allocations is not null and jsonb_typeof(p_allocations) = 'array' and jsonb_array_length(p_allocations) > 0 then
+    for r in
+      select (e ->> 'invoice_id')::uuid as invoice_id, sum((e ->> 'amount')::numeric) as amount
+        from jsonb_array_elements(p_allocations) e group by 1
+    loop
+      if r.amount is null or r.amount <= 0 then
+        raise exception 'مبلغ توزيع غير صحيح';
+      end if;
+      perform 1 from public.supplier_invoices
+        where id = r.invoice_id and supplier_id = p_supplier and status in ('posted', 'partially_paid') for update;
+      if not found then
+        raise exception 'الفاتورة غير موجودة أو غير مفتوحة لهذا المورد';
+      end if;
+      if r.amount > (select total - settled_amount from public.supplier_invoices where id = r.invoice_id) then
+        raise exception 'التوزيع أكبر من المتبقي على الفاتورة %', (select doc_no from public.supplier_invoices where id = r.invoice_id);
+      end if;
+      if r.amount > v_left then
+        raise exception 'مجموع التوزيع أكبر من المبلغ المتاح (%)', p_available;
+      end if;
+      insert into public.supplier_allocations (supplier_id, source_type, source_id, invoice_id, amount)
+      values (p_supplier, p_source_type, p_source, r.invoice_id, r.amount);
+      update public.supplier_invoices set settled_amount = settled_amount + r.amount where id = r.invoice_id;
+      perform public._invoice_refresh_status(r.invoice_id);
+      v_left := v_left - r.amount;
+      v_used := v_used + r.amount;
+    end loop;
+    return v_used;
+  end if;
+
+  for r in
+    select id, total - settled_amount as open_amt from public.supplier_invoices
+     where supplier_id = p_supplier and status in ('posted', 'partially_paid') and total > settled_amount
+     order by coalesce(due_date, invoice_date), invoice_date, created_at
+     for update
+  loop
+    exit when v_left <= 0;
+    v_amt := least(v_left, r.open_amt);
+    insert into public.supplier_allocations (supplier_id, source_type, source_id, invoice_id, amount)
+    values (p_supplier, p_source_type, p_source, r.id, v_amt);
+    update public.supplier_invoices set settled_amount = settled_amount + v_amt where id = r.id;
+    perform public._invoice_refresh_status(r.id);
+    v_left := v_left - v_amt;
+    v_used := v_used + v_amt;
+  end loop;
+  return v_used;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الرصيد الافتتاحي (للمالك، مرة واحدة لكل مورد)
+--   موجب: فاتورة افتتاحية مستحقة. سالب: دفعة مقدمة افتتاحية لدى المورد
+-- ---------------------------------------------------------------------
+create or replace function public.set_supplier_opening_balance(
+  p_supplier uuid, p_amount numeric, p_as_of date, p_reason text, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.suppliers;
+  v_id uuid;
+begin
+  if not public.has_role('owner') then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(p_amount, 0) = 0 or coalesce(trim(p_reason), '') = '' then
+    raise exception 'أدخل المبلغ والسبب';
+  end if;
+  s := public._lock_supplier(p_supplier);
+  if p_client_ref is not null then
+    select id into v_id from public.supplier_invoices where client_ref = p_client_ref;
+    if v_id is null then
+      select id into v_id from public.supplier_payments where client_ref = p_client_ref;
+    end if;
+    if v_id is not null then
+      return v_id;
+    end if;
+  end if;
+  if exists (select 1 from public.supplier_ledger where supplier_id = p_supplier and entry_type = 'opening') then
+    raise exception 'الرصيد الافتتاحي لهذا المورد مسجّل مسبقاً';
+  end if;
+
+  if p_amount > 0 then
+    insert into public.supplier_invoices (supplier_id, kind, status, invoice_date, due_date, payment_terms,
+                                          subtotal, total, notes, client_ref, posted_by, posted_at)
+    values (p_supplier, 'opening', 'posted', coalesce(p_as_of, current_date), coalesce(p_as_of, current_date), 'credit',
+            p_amount, p_amount, trim(p_reason), p_client_ref, auth.uid(), now())
+    returning id into v_id;
+    perform public._ap_post(p_supplier, 'opening', v_id, 'رصيد افتتاحي', 0, p_amount, trim(p_reason), coalesce(p_as_of, current_date));
+  else
+    insert into public.supplier_payments (supplier_id, amount, method, paid_at, notes, client_ref)
+    values (p_supplier, -p_amount, 'opening', coalesce(p_as_of, current_date), trim(p_reason), p_client_ref)
+    returning id into v_id;
+    perform public._ap_post(p_supplier, 'opening', v_id, 'رصيد افتتاحي (مقدّم)', -p_amount, 0, trim(p_reason), coalesce(p_as_of, current_date));
+  end if;
+  return v_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- دفعة للمورد. درج الوردية للمالك/المدير فقط ومن ورديته المفتوحة
+--   p_allocations: [{invoice_id, amount}] أو null = الأقدم استحقاقاً أولاً. المتبقي = دفعة مقدمة
+-- ---------------------------------------------------------------------
+create or replace function public.post_supplier_payment(
+  p_supplier uuid, p_amount numeric, p_method public.ap_payment_method, p_reference text default null,
+  p_paid_at date default null, p_allocations jsonb default null, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.suppliers;
+  v_id uuid;
+  v_no text;
+  v_shift uuid;
+  v_mv uuid;
+  v_used numeric;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(p_amount, 0) <= 0 then
+    raise exception 'مبلغ غير صحيح';
+  end if;
+  if p_method = 'opening' then
+    raise exception 'طريقة دفع غير صالحة';
+  end if;
+  if p_client_ref is not null then
+    -- الضغطة الثانية بنفس المفتاح تنتظر الأولى ثم تعيد نفس الدفعة
+    perform pg_advisory_xact_lock(hashtextextended('sp:' || p_client_ref::text, 0));
+    select id into v_id from public.supplier_payments where client_ref = p_client_ref;
+    if v_id is not null then
+      return v_id;
+    end if;
+  end if;
+  s := public._lock_supplier(p_supplier);
+  if not s.is_active then
+    raise exception 'المورد غير نشط';
+  end if;
+  if p_method in ('bank_transfer', 'cheque') and coalesce(trim(p_reference), '') = '' then
+    raise exception 'أدخل رقم الحوالة أو الشيك';
+  end if;
+
+  insert into public.supplier_payments (supplier_id, amount, method, reference, paid_at, notes, client_ref)
+  values (p_supplier, p_amount, p_method, nullif(trim(p_reference), ''), coalesce(p_paid_at, (now() at time zone 'Asia/Riyadh')::date),
+          nullif(trim(p_notes), ''), p_client_ref)
+  returning id, payment_no into v_id, v_no;
+
+  if p_method = 'cash_drawer' then
+    -- قفل الوردية: لا يُسحب من درج وردية أثناء إغلاقها
+    select id into v_shift from public.shifts where cashier_id = auth.uid() and status = 'open' for update;
+    if v_shift is null then
+      raise exception 'لا توجد لديك وردية مفتوحة للدفع من الدرج — افتح وردية أو اختر طريقة دفع أخرى';
+    end if;
+    insert into public.shift_cash_movements (shift_id, type, amount, reason)
+    values (v_shift, 'out', p_amount, 'دفعة مورد ' || v_no || ': ' || s.name)
+    returning id into v_mv;
+    update public.supplier_payments set shift_id = v_shift, shift_movement_id = v_mv where id = v_id;
+  end if;
+
+  perform public._ap_post(p_supplier, 'payment', v_id, v_no, p_amount, 0, nullif(trim(p_notes), ''),
+                          coalesce(p_paid_at, (now() at time zone 'Asia/Riyadh')::date));
+  v_used := public._ap_allocate(p_supplier, 'payment', v_id, p_amount, p_allocations);
+  update public.supplier_payments set allocated_amount = v_used where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- تطبيق رصيد غير موزّع (دفعة مقدمة، أو إشعار دائن في 0019) على فواتير
+create or replace function public.allocate_supplier_credit(
+  p_source_type text, p_source uuid, p_allocations jsonb default null
+) returns numeric
+language plpgsql security definer set search_path = public as $$
+declare
+  v_supplier uuid;
+  v_free numeric;
+  v_used numeric;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_source_type = 'payment' then
+    select supplier_id into v_supplier from public.supplier_payments where id = p_source and not is_void;
+  elsif p_source_type = 'credit_note' and to_regclass('public.supplier_credit_notes') is not null then
+    execute 'select supplier_id from public.supplier_credit_notes where id = $1 and status = ''posted''' into v_supplier using p_source;
+  end if;
+  if v_supplier is null then
+    raise exception 'المصدر غير موجود أو ملغي';
+  end if;
+  perform public._lock_supplier(v_supplier);
+  if p_source_type = 'payment' then
+    select amount - allocated_amount into v_free from public.supplier_payments where id = p_source for update;
+  else
+    execute 'select total - allocated_amount from public.supplier_credit_notes where id = $1 for update' into v_free using p_source;
+  end if;
+  if v_free <= 0 then
+    raise exception 'لا يوجد رصيد غير موزّع';
+  end if;
+  v_used := public._ap_allocate(v_supplier, p_source_type, p_source, v_free, p_allocations);
+  if v_used = 0 then
+    raise exception 'لا توجد فواتير مفتوحة للتوزيع عليها';
+  end if;
+  if p_source_type = 'payment' then
+    update public.supplier_payments set allocated_amount = allocated_amount + v_used where id = p_source;
+  else
+    execute 'update public.supplier_credit_notes set allocated_amount = allocated_amount + $2 where id = $1' using p_source, v_used;
+  end if;
+  return v_used;
+end;
+$$;
+
+-- إلغاء دفعة: قيد عكسي، وتحرير توزيعاتها. دفعة الدرج تُلغى فقط ووردية الدفع ما زالت مفتوحة (ويعود المبلغ للدرج)
+create or replace function public.void_supplier_payment(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  p public.supplier_payments;
+  r record;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  select * into p from public.supplier_payments where id = p_id;
+  if p.id is null then
+    raise exception 'الدفعة غير موجودة';
+  end if;
+  perform public._lock_supplier(p.supplier_id);
+  select * into p from public.supplier_payments where id = p_id for update;
+  if p.is_void then
+    raise exception 'الدفعة ملغاة مسبقاً';
+  end if;
+  if p.method = 'opening' then
+    raise exception 'لا يُلغى الرصيد الافتتاحي';
+  end if;
+  if p.method = 'cash_drawer' then
+    if (select status from public.shifts where id = p.shift_id for update) <> 'open' then
+      raise exception 'وردية الدفع مغلقة — لا يمكن إلغاء دفعة من درجها (سجّل استرداداً بدلاً من ذلك)';
+    end if;
+    insert into public.shift_cash_movements (shift_id, type, amount, reason)
+    values (p.shift_id, 'in', p.amount, 'إلغاء دفعة مورد ' || p.payment_no);
+  end if;
+
+  for r in select * from public.supplier_allocations where source_type = 'payment' and source_id = p_id and voided_at is null for update loop
+    update public.supplier_allocations set voided_at = now() where id = r.id;
+    update public.supplier_invoices set settled_amount = settled_amount - r.amount where id = r.invoice_id;
+    perform public._invoice_refresh_status(r.invoice_id);
+  end loop;
+  update public.supplier_payments
+     set is_void = true, allocated_amount = 0, void_reason = trim(p_reason), voided_by = auth.uid(), voided_at = now()
+   where id = p_id;
+  perform public._ap_post(p.supplier_id, 'void_payment', p_id, p.payment_no, 0, p.amount, 'إلغاء: ' || trim(p_reason));
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- القراءة: الكشف، الأعمار، المستندات المفتوحة
+-- ---------------------------------------------------------------------
+create or replace function public.supplier_statement(p_supplier uuid, p_from date default null, p_to date default null)
+returns table (entry_id bigint, entry_date date, entry_type public.ap_entry_type, ref_no text, note text,
+               debit numeric, credit numeric, balance numeric, source_id uuid)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  v_open numeric;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select coalesce(sum(l.credit - l.debit), 0) into v_open
+    from public.supplier_ledger l where l.supplier_id = p_supplier and p_from is not null and l.entry_date < p_from;
+  return query
+    select null::bigint, coalesce(p_from, date '1900-01-01'), null::public.ap_entry_type, 'رصيد سابق'::text, null::text,
+           0::numeric, 0::numeric, v_open, null::uuid
+     where p_from is not null
+    union all
+    select l.id, l.entry_date, l.entry_type, l.ref_no, l.note, l.debit, l.credit,
+           v_open + sum(l.credit - l.debit) over (order by l.entry_date, l.id), l.source_id
+      from public.supplier_ledger l
+     where l.supplier_id = p_supplier
+       and (p_from is null or l.entry_date >= p_from) and (p_to is null or l.entry_date <= p_to)
+    order by 2, 1 nulls first;
+end;
+$$;
+
+create or replace function public.supplier_open_documents(p_supplier uuid)
+returns table (invoice_id uuid, doc_no text, supplier_invoice_no text, kind public.ap_invoice_kind,
+               invoice_date date, due_date date, total numeric, settled numeric, outstanding numeric, days_overdue integer)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+    select i.id, i.doc_no, i.supplier_invoice_no, i.kind, i.invoice_date, i.due_date, i.total, i.settled_amount,
+           i.total - i.settled_amount,
+           greatest(((now() at time zone 'Asia/Riyadh')::date - coalesce(i.due_date, i.invoice_date)), 0)
+      from public.supplier_invoices i
+     where i.supplier_id = p_supplier and i.status in ('posted', 'partially_paid') and i.total > i.settled_amount
+     order by coalesce(i.due_date, i.invoice_date), i.invoice_date;
+end;
+$$;
+
+-- الأعمار حسب تاريخ الاستحقاق في يوم محدد. الدفعات المقدمة غير الموزعة تظهر منفصلة وتُطرح من الصافي
+create or replace function public.supplier_aging(p_as_of date default null)
+returns table (supplier_id uuid, supplier_name text, not_due numeric, d1_30 numeric, d31_60 numeric, d61_90 numeric,
+               d90_plus numeric, total_open numeric, unapplied numeric, net_balance numeric, ledger_balance numeric,
+               credit_limit numeric, oldest_due date)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  v_day date := coalesce(p_as_of, (now() at time zone 'Asia/Riyadh')::date);
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with open_inv as (
+    select i.supplier_id, i.total - i.settled_amount as amt, v_day - coalesce(i.due_date, i.invoice_date) as late,
+           coalesce(i.due_date, i.invoice_date) as due
+      from public.supplier_invoices i
+     where i.status in ('posted', 'partially_paid') and i.total > i.settled_amount and i.invoice_date <= v_day
+  ),
+  unapp as (
+    select p.supplier_id, sum(p.amount - p.allocated_amount) as amt
+      from public.supplier_payments p where not p.is_void and p.amount > p.allocated_amount group by 1
+    union all
+    select c.supplier_id, sum(c.total - c.allocated_amount)
+      from public.supplier_credit_notes_open() c group by 1
+  ),
+  agg as (
+    select supplier_id,
+           coalesce(sum(amt) filter (where late <= 0), 0) as nd,
+           coalesce(sum(amt) filter (where late between 1 and 30), 0) as a1,
+           coalesce(sum(amt) filter (where late between 31 and 60), 0) as a2,
+           coalesce(sum(amt) filter (where late between 61 and 90), 0) as a3,
+           coalesce(sum(amt) filter (where late > 90), 0) as a4,
+           min(due) filter (where late > 0) as oldest
+      from open_inv group by 1
+  ),
+  ua as (select supplier_id, sum(amt) as amt from unapp group by 1)
+  select s.id, s.name, coalesce(a.nd, 0), coalesce(a.a1, 0), coalesce(a.a2, 0), coalesce(a.a3, 0), coalesce(a.a4, 0),
+         coalesce(a.nd + a.a1 + a.a2 + a.a3 + a.a4, 0), coalesce(u.amt, 0),
+         coalesce(a.nd + a.a1 + a.a2 + a.a3 + a.a4, 0) - coalesce(u.amt, 0),
+         coalesce(b.balance, 0), s.credit_limit, a.oldest
+    from public.suppliers s
+    left join agg a on a.supplier_id = s.id
+    left join ua u on u.supplier_id = s.id
+    left join public.supplier_balances b on b.supplier_id = s.id
+   where a.supplier_id is not null or u.supplier_id is not null or coalesce(b.balance, 0) <> 0
+   order by coalesce(a.nd + a.a1 + a.a2 + a.a3 + a.a4, 0) desc;
+end;
+$$;
+
+-- الإشعارات الدائنة المفتوحة (تُعرَّف فعلياً في 0019؛ هنا نسخة فارغة حتى تعمل الأعمار قبلها)
+create or replace function public.supplier_credit_notes_open()
+returns table (id uuid, supplier_id uuid, total numeric, allocated_amount numeric)
+language sql stable security definer set search_path = public as $$
+  select null::uuid, null::uuid, 0::numeric, 0::numeric where false
+$$;
+
+create or replace function public.supplier_profile(p_supplier uuid)
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  s public.suppliers;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into s from public.suppliers where id = p_supplier;
+  if s.id is null then
+    raise exception 'المورد غير موجود';
+  end if;
+  return jsonb_build_object(
+    'supplier', to_jsonb(s),
+    'balance', coalesce((select balance from public.supplier_balances where supplier_id = p_supplier), 0),
+    'open_total', coalesce((select sum(total - settled_amount) from public.supplier_invoices
+                             where supplier_id = p_supplier and status in ('posted', 'partially_paid')), 0),
+    'overdue_total', coalesce((select sum(total - settled_amount) from public.supplier_invoices
+                                where supplier_id = p_supplier and status in ('posted', 'partially_paid')
+                                  and coalesce(due_date, invoice_date) < (now() at time zone 'Asia/Riyadh')::date), 0),
+    'unapplied_payments', coalesce((select sum(amount - allocated_amount) from public.supplier_payments
+                                     where supplier_id = p_supplier and not is_void), 0),
+    'invoiced_12m', coalesce((select sum(total) from public.supplier_invoices
+                               where supplier_id = p_supplier and kind <> 'opening' and status not in ('draft', 'void')
+                                 and invoice_date >= current_date - 365), 0),
+    'paid_12m', coalesce((select sum(amount) from public.supplier_payments
+                           where supplier_id = p_supplier and not is_void and method <> 'opening'
+                             and paid_at >= current_date - 365), 0),
+    'last_payment', (select jsonb_build_object('payment_no', payment_no, 'amount', amount, 'paid_at', paid_at)
+                       from public.supplier_payments where supplier_id = p_supplier and not is_void and method <> 'opening'
+                      order by paid_at desc, created_at desc limit 1),
+    'over_credit_limit', s.credit_limit is not null
+                         and coalesce((select balance from public.supplier_balances where supplier_id = p_supplier), 0) > s.credit_limit
+  );
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الصلاحيات: قراءة للمدير، ولا كتابة مباشرة (كل الكتابة عبر الدوال)
+-- ---------------------------------------------------------------------
+alter table public.supplier_invoices enable row level security;
+alter table public.supplier_payments enable row level security;
+alter table public.supplier_allocations enable row level security;
+alter table public.supplier_ledger enable row level security;
+alter table public.supplier_balances enable row level security;
+
+revoke all on public.supplier_invoices, public.supplier_payments, public.supplier_allocations,
+  public.supplier_ledger, public.supplier_balances from anon, authenticated;
+revoke usage on sequence public.supplier_invoice_seq, public.supplier_payment_seq from anon;
+grant select on public.supplier_invoices, public.supplier_payments, public.supplier_allocations,
+  public.supplier_ledger, public.supplier_balances to authenticated;
+
+create policy supplier_invoices_select on public.supplier_invoices for select to authenticated using (public.is_manager());
+create policy supplier_payments_select on public.supplier_payments for select to authenticated using (public.is_manager());
+create policy supplier_allocations_select on public.supplier_allocations for select to authenticated using (public.is_manager());
+create policy supplier_ledger_select on public.supplier_ledger for select to authenticated using (public.is_manager());
+create policy supplier_balances_select on public.supplier_balances for select to authenticated using (public.is_manager());
+
+create trigger supplier_invoices_audit after insert or update or delete on public.supplier_invoices
+  for each row execute function public.audit_trigger();
+create trigger supplier_payments_audit after insert or update or delete on public.supplier_payments
+  for each row execute function public.audit_trigger();
+create trigger supplier_allocations_audit after insert or update or delete on public.supplier_allocations
+  for each row execute function public.audit_trigger();
+
+revoke all on function
+  public._check_supplier_integrity(uuid), public.supplier_integrity_trigger(),
+  public._ap_post(uuid, public.ap_entry_type, uuid, text, numeric, numeric, text, date),
+  public._lock_supplier(uuid), public._invoice_refresh_status(uuid),
+  public._ap_allocate(uuid, text, uuid, numeric, jsonb), public.supplier_credit_notes_open()
+from public, anon, authenticated;
+
+revoke execute on function
+  public.set_supplier_opening_balance(uuid, numeric, date, text, uuid),
+  public.post_supplier_payment(uuid, numeric, public.ap_payment_method, text, date, jsonb, text, uuid),
+  public.allocate_supplier_credit(text, uuid, jsonb),
+  public.void_supplier_payment(uuid, text),
+  public.supplier_statement(uuid, date, date),
+  public.supplier_open_documents(uuid),
+  public.supplier_aging(date),
+  public.supplier_profile(uuid)
+from public, anon;
+grant execute on function
+  public.set_supplier_opening_balance(uuid, numeric, date, text, uuid),
+  public.post_supplier_payment(uuid, numeric, public.ap_payment_method, text, date, jsonb, text, uuid),
+  public.allocate_supplier_credit(text, uuid, jsonb),
+  public.void_supplier_payment(uuid, text),
+  public.supplier_statement(uuid, date, date),
+  public.supplier_open_documents(uuid),
+  public.supplier_aging(date),
+  public.supplier_profile(uuid)
+to authenticated;
+
+-- =====================================================================
+-- 0018_purchase_documents.sql
+-- =====================================================================
+-- =====================================================================
+-- 0018 مستندات الشراء (PR #9 — المرحلة 2)
+--   • الاستلام الجزئي: سند استلام (GRN) لكل دفعة واصلة، لا يُعدَّل بعد ترحيله
+--     المخزون يدخل موقع أمر الشراء، والتكلفة المتوسطة تتحدث مؤقتاً بسعر أمر الشراء
+--   • فاتورة المورد مرتبطة بسطور الاستلام + مطابقة ثلاثية (أمر الشراء ↔ الاستلام ↔ الفاتورة)
+--     سماح فرق السعر من الإعدادات (افتراضي 2%). المفوتر أكثر من المستلم ممنوع دائماً
+--   • ترحيل الفاتورة ينشئ الدَّين في دفتر المورد، ويسوّي فرق السعر عن سعر أمر الشراء:
+--     نصيب الكمية الباقية في المخزون يعدّل المتوسط، ونصيب ما بيع قبل الفاتورة = فرق تكلفة بتاريخ الترحيل
+--   • طريقة السداد: نقدي (دفعة كاملة عند الترحيل) / آجل / جزئي
+--   • شراء مباشر بدون أمر شراء: ينشئ أمر الشراء والاستلام والفاتورة في عملية واحدة
+--   • المرفقات في مخزن ملفات خاص للمدير فقط
+--   • توافق عكسي: receive_purchase بنفس التوقيع (يستلم كل المتبقي)، والكتابة القديمة على أوامر الشراء كما هي
+-- =====================================================================
+
+-- القيم الجديدة تُستخدم داخل الدوال فقط (لا فهارس ولا قيود تعتمد عليها في نفس المعاملة)
+alter type public.purchase_status add value if not exists 'partially_received' after 'ordered';
+alter type public.purchase_status add value if not exists 'closed' after 'received';
+
+alter table public.store_settings
+  add column purchase_match_tolerance_pct numeric(5,2) not null default 2.00
+    check (purchase_match_tolerance_pct between 0 and 50);
+
+alter table public.purchase_orders
+  add column expected_at date,
+  add column approved_by uuid references public.profiles (id),
+  add column approved_at timestamptz,
+  add column close_reason text,
+  add column client_ref uuid unique;
+
+alter table public.purchase_items
+  add column qty_received integer not null default 0 check (qty_received >= 0),
+  add column qty_invoiced integer not null default 0 check (qty_invoiced >= 0),
+  add column qty_returned integer not null default 0 check (qty_returned >= 0),
+  add constraint purchase_items_received_le_qty check (qty_received <= qty),
+  add constraint purchase_items_invoiced_le_received check (qty_invoiced <= qty_received),
+  add constraint purchase_items_returned_le_received check (qty_returned <= qty_received);
+
+-- ---------------------------------------------------------------------
+-- سندات الاستلام
+-- ---------------------------------------------------------------------
+create sequence public.goods_receipt_seq start 1;
+
+create table public.goods_receipts (
+  id uuid primary key default gen_random_uuid(),
+  grn_no text not null unique
+    default 'GRN-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.goods_receipt_seq')::text, 5, '0'),
+  purchase_order_id uuid not null references public.purchase_orders (id),
+  supplier_id uuid not null references public.suppliers (id),
+  location_id uuid references public.locations (id),
+  notes text,
+  is_historical boolean not null default false,     -- أوامر شراء استُلمت قبل هذه الترقية
+  client_ref uuid unique,
+  received_by uuid references public.profiles (id) default auth.uid(),
+  received_at timestamptz not null default clock_timestamp()
+);
+create index goods_receipts_po_idx on public.goods_receipts (purchase_order_id);
+
+create table public.goods_receipt_items (
+  id uuid primary key default gen_random_uuid(),
+  receipt_id uuid not null references public.goods_receipts (id) on delete cascade,
+  purchase_item_id uuid not null references public.purchase_items (id),
+  variant_id uuid not null references public.product_variants (id),
+  qty integer not null check (qty > 0),
+  unit_cost numeric(12,2) not null check (unit_cost >= 0),     -- سعر أمر الشراء وقت الاستلام (قبل الضريبة)
+  qty_invoiced integer not null default 0 check (qty_invoiced >= 0),
+  qty_returned integer not null default 0 check (qty_returned >= 0),
+  constraint gri_invoiced_le_qty check (qty_invoiced <= qty),
+  constraint gri_returned_le_qty check (qty_returned <= qty)
+);
+create index goods_receipt_items_receipt_idx on public.goods_receipt_items (receipt_id);
+create index goods_receipt_items_pi_idx on public.goods_receipt_items (purchase_item_id);
+
+-- أوامر الشراء المستلمة سابقاً: سند استلام تاريخي واحد، مفوتر بالكامل (لا دَين ولا تعديل تكلفة)
+update public.purchase_items pi set qty_received = pi.qty, qty_invoiced = pi.qty
+  from public.purchase_orders po where po.id = pi.purchase_id and po.status = 'received';
+insert into public.goods_receipts (purchase_order_id, supplier_id, location_id, notes, is_historical, received_by, received_at)
+select po.id, po.supplier_id, po.location_id, 'استلام قبل ترقية المشتريات', true, po.received_by, coalesce(po.received_at, po.updated_at)
+  from public.purchase_orders po where po.status = 'received';
+insert into public.goods_receipt_items (receipt_id, purchase_item_id, variant_id, qty, unit_cost, qty_invoiced)
+select gr.id, pi.id, pi.variant_id, pi.qty, pi.unit_cost, pi.qty
+  from public.goods_receipts gr join public.purchase_items pi on pi.purchase_id = gr.purchase_order_id
+ where gr.is_historical;
+
+-- ---------------------------------------------------------------------
+-- فواتير المورد: ربط بأمر الشراء + بنود
+-- ---------------------------------------------------------------------
+alter table public.supplier_invoices
+  add column purchase_order_id uuid references public.purchase_orders (id),
+  add column location_id uuid references public.locations (id),
+  add column match_status text check (match_status in ('not_required', 'matched', 'within_tolerance', 'override')),
+  add column match_override_by uuid references public.profiles (id),
+  add column match_override_reason text;
+
+create table public.supplier_invoice_items (
+  id uuid primary key default gen_random_uuid(),
+  invoice_id uuid not null references public.supplier_invoices (id) on delete cascade,
+  receipt_item_id uuid references public.goods_receipt_items (id),     -- سطر بضاعة
+  variant_id uuid references public.product_variants (id),
+  description text,                                                    -- سطر مصروف (شحن، خدمة…)
+  qty integer not null default 1 check (qty > 0),
+  unit_cost numeric(12,2) not null check (unit_cost >= 0),
+  po_unit_cost numeric(12,2),
+  line_total numeric(12,2) not null check (line_total >= 0),
+  vat_rate numeric(5,2) not null default 0,
+  vat_amount numeric(12,2) not null default 0 check (vat_amount >= 0),
+  constraint sii_stock_or_expense check ((receipt_item_id is not null and variant_id is not null) or
+                                         (receipt_item_id is null and coalesce(trim(description), '') <> ''))
+);
+create index supplier_invoice_items_invoice_idx on public.supplier_invoice_items (invoice_id);
+create index supplier_invoice_items_gri_idx on public.supplier_invoice_items (receipt_item_id);
+
+-- ---------------------------------------------------------------------
+-- تعديلات التكلفة (فرق سعر الفاتورة هنا، وتكاليف الوصول والإشعارات السعرية في 0019)
+-- ---------------------------------------------------------------------
+create table public.cost_adjustments (
+  id bigint generated always as identity primary key,
+  variant_id uuid not null references public.product_variants (id),
+  source_type text not null check (source_type in ('invoice_price', 'invoice_void', 'landed_cost', 'credit_note')),
+  source_id uuid not null,
+  qty_basis integer not null check (qty_basis > 0),        -- الكمية التي يخصها التعديل
+  qty_in_stock integer not null check (qty_in_stock >= 0), -- منها ما زال في المخزون وقت الترحيل
+  total_delta numeric(12,2) not null,
+  stock_delta numeric(12,2) not null,                      -- يدخل متوسط التكلفة
+  variance_delta numeric(12,2) not null,                   -- فرق تكلفة (نصيب ما بيع)
+  cost_before numeric(12,2) not null,
+  cost_after numeric(12,2) not null,
+  posted_by uuid references public.profiles (id) default auth.uid(),
+  posted_at timestamptz not null default clock_timestamp()
+);
+create index cost_adjustments_posted_idx on public.cost_adjustments (posted_at);
+create index cost_adjustments_source_idx on public.cost_adjustments (source_type, source_id);
+
+-- ---------------------------------------------------------------------
+-- المرفقات (مخزن خاص)
+-- ---------------------------------------------------------------------
+create table public.purchase_attachments (
+  id uuid primary key default gen_random_uuid(),
+  owner_type text not null check (owner_type in ('purchase_order', 'goods_receipt', 'supplier_invoice', 'supplier_payment',
+                                                 'supplier_return', 'credit_note', 'landed_cost')),
+  owner_id uuid not null,
+  file_path text not null unique,
+  file_name text not null,
+  mime_type text not null,
+  size_bytes integer not null check (size_bytes > 0 and size_bytes <= 10485760),
+  uploaded_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now()
+);
+create index purchase_attachments_owner_idx on public.purchase_attachments (owner_type, owner_id);
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('purchase-docs', 'purchase-docs', false, 10485760, array['application/pdf', 'image/jpeg', 'image/png', 'image/webp'])
+on conflict (id) do nothing;
+create policy "purchase docs read" on storage.objects for select to authenticated
+  using (bucket_id = 'purchase-docs' and public.is_manager());
+create policy "purchase docs insert" on storage.objects for insert to authenticated
+  with check (bucket_id = 'purchase-docs' and public.is_manager());
+
+-- ---------------------------------------------------------------------
+-- حماية أمر الشراء: الحالات الناتجة عن الاستلام لا تُضبط إلا من الدوال، ولا يُلغى بعد أي استلام
+-- (الكتابة القديمة على المسودة والمرسل تبقى كما هي)
+-- ---------------------------------------------------------------------
+create or replace function public.purchase_order_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare
+  v_rpc boolean := coalesce(current_setting('app.po_rpc', true), '') = 'on';
+begin
+  if v_rpc then
+    return new;
+  end if;
+  if new.status::text in ('partially_received', 'received', 'closed') and new.status is distinct from old.status then
+    raise exception 'حالة أمر الشراء تتغير بالاستلام فقط';
+  end if;
+  if new.status::text = 'cancelled' and old.status::text <> 'cancelled'
+     and exists (select 1 from public.purchase_items where purchase_id = new.id and qty_received > 0) then
+    raise exception 'لا يمكن إلغاء أمر شراء استُلم منه جزء — أغلق المتبقي بدلاً من ذلك';
+  end if;
+  return new;
+end;
+$$;
+create trigger purchase_orders_guard before update on public.purchase_orders
+  for each row execute function public.purchase_order_guard();
+
+create or replace function public.purchase_item_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if coalesce(current_setting('app.po_rpc', true), '') = 'on' then
+    return coalesce(new, old);
+  end if;
+  if tg_op in ('UPDATE', 'DELETE') and (old.qty_received > 0 or old.qty_invoiced > 0) then
+    raise exception 'لا يمكن تعديل سطر استُلم منه — أنشئ أمر شراء جديداً للفرق';
+  end if;
+  if tg_op = 'UPDATE' and (new.qty_received <> old.qty_received or new.qty_invoiced <> old.qty_invoiced
+                           or new.qty_returned <> old.qty_returned) then
+    raise exception 'الكميات المستلمة والمفوترة تتغير من المستندات فقط';
+  end if;
+  if tg_op = 'INSERT' and (new.qty_received <> 0 or new.qty_invoiced <> 0 or new.qty_returned <> 0) then
+    raise exception 'الكميات المستلمة والمفوترة تتغير من المستندات فقط';
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+create trigger purchase_items_guard before insert or update or delete on public.purchase_items
+  for each row execute function public.purchase_item_guard();
+
+-- ---------------------------------------------------------------------
+-- تعديل التكلفة: نصيب الموجود يدخل المتوسط، ونصيب ما بيع = فرق تكلفة
+-- ---------------------------------------------------------------------
+create or replace function public._apply_cost_adjustment(
+  p_variant uuid, p_qty_basis integer, p_delta numeric, p_source_type text, p_source uuid
+) returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_on_hand integer;
+  v_cost numeric;
+  v_rem integer;
+  v_stock numeric;
+  v_new numeric;
+begin
+  if coalesce(p_delta, 0) = 0 or coalesce(p_qty_basis, 0) <= 0 then
+    return;
+  end if;
+  select greatest(v.stock_qty, 0), coalesce(c.cost_price, 0) into v_on_hand, v_cost
+    from public.product_variants v left join public.variant_costs c on c.variant_id = v.id
+   where v.id = p_variant for update of v;
+  v_rem := least(p_qty_basis, v_on_hand);
+  v_stock := round(p_delta * v_rem / p_qty_basis, 2);
+  v_new := v_cost;
+  if v_on_hand > 0 and v_stock <> 0 then
+    v_new := round((v_on_hand * v_cost + v_stock) / v_on_hand, 2);
+    if v_new < 0 then
+      -- لا تكلفة سالبة: الفائض يذهب لفرق التكلفة
+      v_stock := -v_on_hand * v_cost;
+      v_new := 0;
+    end if;
+    insert into public.variant_costs (variant_id, cost_price) values (p_variant, v_new)
+    on conflict (variant_id) do update set cost_price = excluded.cost_price, updated_at = now();
+  else
+    v_stock := 0;
+  end if;
+  insert into public.cost_adjustments (variant_id, source_type, source_id, qty_basis, qty_in_stock, total_delta,
+                                       stock_delta, variance_delta, cost_before, cost_after)
+  values (p_variant, p_source_type, p_source, p_qty_basis, v_rem, p_delta, v_stock, p_delta - v_stock, v_cost, v_new);
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- أوامر الشراء: اعتماد، إغلاق المتبقي
+-- ---------------------------------------------------------------------
+create or replace function public.approve_purchase_order(p_id uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  po public.purchase_orders;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into po from public.purchase_orders where id = p_id for update;
+  if po.id is null or po.status <> 'draft' then
+    raise exception 'أمر الشراء ليس مسودة';
+  end if;
+  if not exists (select 1 from public.purchase_items where purchase_id = p_id) then
+    raise exception 'أمر الشراء لا يحتوي أصنافاً';
+  end if;
+  update public.purchase_orders set status = 'ordered', approved_by = auth.uid(), approved_at = now() where id = p_id;
+end;
+$$;
+
+create or replace function public.close_purchase_order(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  po public.purchase_orders;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  select * into po from public.purchase_orders where id = p_id for update;
+  if po.id is null or po.status::text <> 'partially_received' then
+    raise exception 'يُغلق المتبقي لأمر شراء مستلم جزئياً فقط (غير المستلم: ألغه)';
+  end if;
+  perform set_config('app.po_rpc', 'on', true);
+  update public.purchase_orders set status = 'closed', close_reason = trim(p_reason) where id = p_id;
+  perform set_config('app.po_rpc', '', true);
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الاستلام الجزئي. p_items: [{purchase_item_id | variant_id, qty}] أو null = كل المتبقي
+--   المدير، أو موظف موقع الاستلام (الكمية فقط)
+-- ---------------------------------------------------------------------
+create or replace function public.receive_goods(
+  p_po uuid, p_items jsonb default null, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  po public.purchase_orders;
+  v_loc uuid;
+  v_grn uuid;
+  v_grn_no text;
+  r record;
+  v_qty integer;
+  v_old_qty integer;
+  v_old_cost numeric;
+  v_total integer := 0;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('grn:' || p_client_ref::text, 0));
+    select id into v_grn from public.goods_receipts where client_ref = p_client_ref;
+    if v_grn is not null then
+      return v_grn;
+    end if;
+  end if;
+  select * into po from public.purchase_orders where id = p_po for update;
+  if po.id is null then
+    raise exception 'أمر الشراء غير موجود';
+  end if;
+  if po.status::text not in ('draft', 'ordered', 'partially_received') then
+    raise exception 'لا يمكن استلام أمر شراء بحالة %', po.status;
+  end if;
+  v_loc := coalesce(po.location_id, public._default_location());
+  if not public.is_manager() and public._my_location() is distinct from v_loc then
+    raise exception 'الاستلام لموظفي موقع الاستلام أو المدير فقط';
+  end if;
+  if not exists (select 1 from public.purchase_items where purchase_id = p_po) then
+    raise exception 'أمر الشراء لا يحتوي أصنافاً';
+  end if;
+
+  perform set_config('app.po_rpc', 'on', true);
+  insert into public.goods_receipts (purchase_order_id, supplier_id, location_id, notes, client_ref)
+  values (p_po, po.supplier_id, v_loc, nullif(trim(p_notes), ''), p_client_ref)
+  returning id, grn_no into v_grn, v_grn_no;
+
+  for r in
+    select pi.*,
+           case when p_items is null then pi.qty - pi.qty_received
+                else coalesce((select sum((e ->> 'qty')::integer) from jsonb_array_elements(p_items) e
+                                where (e ->> 'purchase_item_id')::uuid = pi.id
+                                   or ((e ->> 'purchase_item_id') is null and (e ->> 'variant_id')::uuid = pi.variant_id)), 0) end as want
+      from public.purchase_items pi where pi.purchase_id = p_po
+     order by pi.id
+     for update of pi
+  loop
+    v_qty := r.want;
+    continue when v_qty = 0;
+    if v_qty < 0 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+    if v_qty > r.qty - r.qty_received then
+      raise exception 'الكمية المستلمة أكبر من المتبقي في أمر الشراء (المتبقي %)', r.qty - r.qty_received;
+    end if;
+
+    -- المتوسط المرجّح بسعر أمر الشراء (مؤقتاً حتى الفاتورة)
+    select greatest(v.stock_qty, 0), coalesce(c.cost_price, 0) into v_old_qty, v_old_cost
+      from public.product_variants v left join public.variant_costs c on c.variant_id = v.id
+     where v.id = r.variant_id for update of v;
+    insert into public.variant_costs (variant_id, cost_price)
+    values (r.variant_id, case when v_old_qty + v_qty > 0
+                               then round((v_old_qty * v_old_cost + v_qty * r.unit_cost) / (v_old_qty + v_qty), 2)
+                               else r.unit_cost end)
+    on conflict (variant_id) do update set cost_price = excluded.cost_price, updated_at = now();
+
+    perform public._move_stock(r.variant_id, v_qty, 'purchase', p_po, v_grn_no, false);
+    insert into public.goods_receipt_items (receipt_id, purchase_item_id, variant_id, qty, unit_cost)
+    values (v_grn, r.id, r.variant_id, v_qty, r.unit_cost);
+    update public.purchase_items set qty_received = qty_received + v_qty where id = r.id;
+    v_total := v_total + v_qty;
+  end loop;
+
+  if v_total = 0 then
+    raise exception 'لم يتم تحديد كميات للاستلام';
+  end if;
+  if p_items is not null and exists (
+    select 1 from jsonb_array_elements(p_items) e
+     where not exists (select 1 from public.purchase_items pi where pi.purchase_id = p_po
+                         and (pi.id = (e ->> 'purchase_item_id')::uuid
+                              or ((e ->> 'purchase_item_id') is null and pi.variant_id = (e ->> 'variant_id')::uuid)))) then
+    raise exception 'صنف غير موجود في أمر الشراء';
+  end if;
+
+  if exists (select 1 from public.purchase_items where purchase_id = p_po and qty_received < qty) then
+    update public.purchase_orders set status = 'partially_received' where id = p_po;
+  else
+    update public.purchase_orders set status = 'received', received_at = now(), received_by = auth.uid() where id = p_po;
+  end if;
+  perform set_config('app.po_rpc', '', true);
+  return v_grn;
+end;
+$$;
+
+-- التوافق العكسي: نفس التوقيع والسلوك (استلام كل المتبقي)؛ الكود الحالي يستمر في العمل
+create or replace function public.receive_purchase(p_purchase_id uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  perform public.receive_goods(p_purchase_id, null, null, null);
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الفاتورة: حفظ مسودة، مطابقة، ترحيل، إلغاء
+--   p_lines: [{receipt_item_id, qty, unit_cost}] للبضاعة، أو [{description, amount}] للمصروف
+-- ---------------------------------------------------------------------
+create or replace function public._vat_rate_for(p_supplier uuid)
+returns numeric language sql stable security definer set search_path = public as $$
+  select case when (select vat_registered from public.suppliers where id = p_supplier)
+              then (select vat_rate from public.store_settings where id = 1) else 0 end
+$$;
+
+create or replace function public.save_supplier_invoice(
+  p_id uuid, p_supplier uuid, p_po uuid, p_supplier_invoice_no text, p_invoice_date date, p_due_date date,
+  p_payment_terms public.ap_payment_terms, p_lines jsonb, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  s public.suppliers;
+  po public.purchase_orders;
+  v_id uuid := p_id;
+  v_rate numeric;
+  e jsonb;
+  gri record;
+  v_qty integer;
+  v_cost numeric;
+  v_line numeric;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'الفاتورة بدون بنود';
+  end if;
+  if v_id is null and p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('sin:' || p_client_ref::text, 0));
+    select id into v_id from public.supplier_invoices where client_ref = p_client_ref;
+    if v_id is not null and (select status from public.supplier_invoices where id = v_id) <> 'draft' then
+      return v_id;
+    end if;
+  end if;
+  s := public._lock_supplier(p_supplier);
+  if p_po is not null then
+    select * into po from public.purchase_orders where id = p_po;
+    if po.id is null or po.supplier_id <> p_supplier then
+      raise exception 'أمر الشراء لا يخص هذا المورد';
+    end if;
+  end if;
+  v_rate := public._vat_rate_for(p_supplier);
+
+  if v_id is null then
+    insert into public.supplier_invoices (supplier_id, kind, supplier_invoice_no, invoice_date, due_date, payment_terms,
+                                          purchase_order_id, location_id, notes, client_ref)
+    values (p_supplier, case when p_po is null and not exists (select 1 from jsonb_array_elements(p_lines) x where x ? 'receipt_item_id')
+                             then 'expense' else 'purchase' end::public.ap_invoice_kind,
+            nullif(trim(p_supplier_invoice_no), ''), coalesce(p_invoice_date, current_date),
+            coalesce(p_due_date, coalesce(p_invoice_date, current_date) + s.payment_terms_days),
+            coalesce(p_payment_terms, (case when s.payment_terms_days > 0 then 'credit' else 'cash' end)::public.ap_payment_terms),
+            p_po, po.location_id, nullif(trim(p_notes), ''), p_client_ref)
+    returning id into v_id;
+  else
+    perform 1 from public.supplier_invoices where id = v_id and supplier_id = p_supplier and status = 'draft' for update;
+    if not found then
+      raise exception 'الفاتورة غير موجودة أو ليست مسودة';
+    end if;
+    update public.supplier_invoices
+       set supplier_invoice_no = nullif(trim(p_supplier_invoice_no), ''), invoice_date = coalesce(p_invoice_date, invoice_date),
+           due_date = coalesce(p_due_date, coalesce(p_invoice_date, invoice_date) + s.payment_terms_days),
+           payment_terms = coalesce(p_payment_terms, payment_terms), purchase_order_id = p_po,
+           location_id = coalesce(po.location_id, location_id), notes = nullif(trim(p_notes), '')
+     where id = v_id;
+    delete from public.supplier_invoice_items where invoice_id = v_id;
+  end if;
+
+  for e in select * from jsonb_array_elements(p_lines) loop
+    if e ? 'receipt_item_id' then
+      select gi.*, gr.supplier_id as sup, gr.purchase_order_id as po_id into gri
+        from public.goods_receipt_items gi join public.goods_receipts gr on gr.id = gi.receipt_id
+       where gi.id = (e ->> 'receipt_item_id')::uuid;
+      if gri.id is null or gri.sup <> p_supplier then
+        raise exception 'سطر الاستلام لا يخص هذا المورد';
+      end if;
+      if p_po is not null and gri.po_id <> p_po then
+        raise exception 'سطر الاستلام من أمر شراء آخر';
+      end if;
+      v_qty := coalesce((e ->> 'qty')::integer, 0);
+      v_cost := coalesce((e ->> 'unit_cost')::numeric, gri.unit_cost);
+      if v_qty <= 0 or v_cost < 0 then
+        raise exception 'كمية أو سعر غير صحيح';
+      end if;
+      v_line := round(v_qty * v_cost, 2);
+      insert into public.supplier_invoice_items (invoice_id, receipt_item_id, variant_id, qty, unit_cost, po_unit_cost,
+                                                 line_total, vat_rate, vat_amount)
+      values (v_id, gri.id, gri.variant_id, v_qty, v_cost, gri.unit_cost, v_line, v_rate, round(v_line * v_rate / 100, 2));
+    else
+      v_line := round(coalesce((e ->> 'amount')::numeric, 0), 2);
+      if v_line <= 0 or coalesce(trim(e ->> 'description'), '') = '' then
+        raise exception 'أدخل وصف ومبلغ سطر المصروف';
+      end if;
+      insert into public.supplier_invoice_items (invoice_id, description, qty, unit_cost, line_total, vat_rate, vat_amount)
+      values (v_id, trim(e ->> 'description'), 1, v_line, v_line,
+              case when coalesce((e ->> 'vat')::boolean, true) then v_rate else 0 end,
+              case when coalesce((e ->> 'vat')::boolean, true) then round(v_line * v_rate / 100, 2) else 0 end);
+    end if;
+  end loop;
+
+  update public.supplier_invoices i
+     set subtotal = x.sub, vat_amount = x.vat, total = x.sub + x.vat
+    from (select coalesce(sum(line_total), 0) as sub, coalesce(sum(vat_amount), 0) as vat
+            from public.supplier_invoice_items where invoice_id = v_id) x
+   where i.id = v_id;
+  return v_id;
+end;
+$$;
+
+-- المطابقة الثلاثية سطراً بسطر
+create or replace function public.match_invoice(p_id uuid)
+returns table (line_id uuid, receipt_item_id uuid, variant_id uuid, sku text, product_name text,
+               qty_ordered integer, qty_received integer, qty_invoiced_before integer, qty_this integer,
+               po_unit_cost numeric, invoice_unit_cost numeric, diff_pct numeric, result text)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  v_tol numeric := (select purchase_match_tolerance_pct from public.store_settings where id = 1);
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with lines as (
+    select l.id, l.receipt_item_id, l.variant_id, l.qty, l.unit_cost, gi.unit_cost as po_cost, gi.qty as gr_qty,
+           gi.qty_invoiced, pi.qty as ordered,
+           -- نفس سطر الاستلام في أكثر من سطر من نفس الفاتورة
+           sum(l.qty) over (partition by l.receipt_item_id) as qty_in_invoice
+      from public.supplier_invoice_items l
+      join public.goods_receipt_items gi on gi.id = l.receipt_item_id
+      join public.purchase_items pi on pi.id = gi.purchase_item_id
+     where l.invoice_id = p_id
+  )
+  select l.id, l.receipt_item_id, l.variant_id, v.sku, p.name, l.ordered, l.gr_qty, l.qty_invoiced, l.qty,
+         l.po_cost, l.unit_cost,
+         case when l.po_cost > 0 then round(abs(l.unit_cost - l.po_cost) / l.po_cost * 100, 2)
+              when l.unit_cost > 0 then 100 else 0 end,
+         case when l.qty_in_invoice > l.gr_qty - l.qty_invoiced then 'qty_over_received'
+              when l.unit_cost = l.po_cost then 'matched'
+              when l.po_cost > 0 and abs(l.unit_cost - l.po_cost) / l.po_cost * 100 <= v_tol then 'within_tolerance'
+              else 'price_over_tolerance' end
+    from lines l
+    join public.product_variants v on v.id = l.variant_id
+    join public.products p on p.id = v.product_id
+   order by p.name, v.sku;
+end;
+$$;
+
+-- ترحيل الفاتورة. p_payment للسداد النقدي/الجزئي: {method, reference, amount(للجزئي)}
+create or replace function public.post_supplier_invoice(
+  p_id uuid, p_override_reason text default null, p_payment jsonb default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  i public.supplier_invoices;
+  r record;
+  v_status text := 'not_required';
+  v_pay numeric;
+  v_method public.ap_payment_method;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  -- ضغطتان على «ترحيل»: الثانية تنتظر ثم تجد الفاتورة مرحّلة وتعود بلا أثر
+  perform pg_advisory_xact_lock(hashtextextended('sin-post:' || p_id::text, 0));
+  select * into i from public.supplier_invoices where id = p_id;
+  if i.id is null then
+    raise exception 'الفاتورة غير موجودة';
+  end if;
+  perform public._lock_supplier(i.supplier_id);
+  select * into i from public.supplier_invoices where id = p_id for update;
+  if i.status <> 'draft' then
+    if i.status = 'void' then
+      raise exception 'الفاتورة ملغاة';
+    end if;
+    return p_id;
+  end if;
+  if i.total <= 0 or not exists (select 1 from public.supplier_invoice_items where invoice_id = p_id) then
+    raise exception 'الفاتورة بدون مبلغ';
+  end if;
+  if i.supplier_invoice_no is null and i.kind = 'purchase' then
+    raise exception 'أدخل رقم فاتورة المورد';
+  end if;
+
+  -- المطابقة
+  if exists (select 1 from public.supplier_invoice_items where invoice_id = p_id and receipt_item_id is not null) then
+    v_status := 'matched';
+    for r in select * from public.match_invoice(p_id) loop
+      if r.result = 'qty_over_received' then
+        raise exception 'الكمية المفوترة من % أكبر من المستلم غير المفوتر', r.sku;
+      elsif r.result = 'price_over_tolerance' then
+        if coalesce(trim(p_override_reason), '') = '' then
+          raise exception 'فرق السعر في % (% مقابل % في أمر الشراء، %%%) خارج نسبة السماح — يتطلب تجاوزاً بسبب',
+            r.sku, r.invoice_unit_cost, r.po_unit_cost, r.diff_pct;
+        end if;
+        v_status := 'override';
+      elsif r.result = 'within_tolerance' and v_status = 'matched' then
+        v_status := 'within_tolerance';
+      end if;
+    end loop;
+    if v_status = 'override' and (select inventory_segregation from public.store_settings where id = 1)
+       and i.created_by = auth.uid() then
+      raise exception 'فصل المهام مفعّل: من أنشأ الفاتورة لا يعتمد تجاوز مطابقتها';
+    end if;
+  end if;
+
+  perform set_config('app.po_rpc', 'on', true);
+  for r in select l.*, gi.purchase_item_id, gi.unit_cost as grn_cost
+             from public.supplier_invoice_items l join public.goods_receipt_items gi on gi.id = l.receipt_item_id
+            where l.invoice_id = p_id order by l.id loop
+    update public.goods_receipt_items set qty_invoiced = qty_invoiced + r.qty where id = r.receipt_item_id;
+    update public.purchase_items set qty_invoiced = qty_invoiced + r.qty where id = r.purchase_item_id;
+    perform public._apply_cost_adjustment(r.variant_id, r.qty, round(r.qty * (r.unit_cost - r.grn_cost), 2), 'invoice_price', p_id);
+  end loop;
+  perform set_config('app.po_rpc', '', true);
+
+  update public.supplier_invoices
+     set status = 'posted', posted_by = auth.uid(), posted_at = now(), match_status = v_status,
+         match_override_by = case when v_status = 'override' then auth.uid() end,
+         match_override_reason = case when v_status = 'override' then trim(p_override_reason) end
+   where id = p_id;
+  perform public._ap_post(i.supplier_id, 'invoice', p_id, coalesce(i.supplier_invoice_no, i.doc_no), 0, i.total,
+                          i.doc_no, i.invoice_date);
+
+  -- السداد عند الترحيل
+  if i.payment_terms in ('cash', 'partial') then
+    v_pay := case when i.payment_terms = 'cash' then i.total else (p_payment ->> 'amount')::numeric end;
+    if v_pay is null or v_pay <= 0 or v_pay > i.total or (i.payment_terms = 'partial' and v_pay >= i.total) then
+      raise exception 'أدخل مبلغ الدفعة الجزئية (أقل من إجمالي الفاتورة)';
+    end if;
+    v_method := coalesce(p_payment ->> 'method', 'cash')::public.ap_payment_method;
+    perform public.post_supplier_payment(i.supplier_id, v_pay, v_method, p_payment ->> 'reference', i.invoice_date,
+                                         jsonb_build_array(jsonb_build_object('invoice_id', p_id, 'amount', v_pay)),
+                                         'سداد ' || coalesce(i.supplier_invoice_no, i.doc_no),
+                                         md5('pay:' || p_id::text)::uuid);
+  end if;
+  return p_id;
+end;
+$$;
+
+-- إلغاء فاتورة مرحّلة: بشرط عدم وجود سداد عليها. يعكس الكميات المفوترة وتعديل التكلفة والقيد
+create or replace function public.void_supplier_invoice(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  i public.supplier_invoices;
+  r record;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  select * into i from public.supplier_invoices where id = p_id;
+  if i.id is null then
+    raise exception 'الفاتورة غير موجودة';
+  end if;
+  perform public._lock_supplier(i.supplier_id);
+  select * into i from public.supplier_invoices where id = p_id for update;
+  if i.status = 'draft' then
+    update public.supplier_invoices set status = 'void', void_reason = trim(p_reason), voided_by = auth.uid(), voided_at = now()
+     where id = p_id;
+    return;
+  end if;
+  if i.status = 'void' then
+    raise exception 'الفاتورة ملغاة مسبقاً';
+  end if;
+  if i.kind = 'opening' then
+    raise exception 'لا يُلغى الرصيد الافتتاحي';
+  end if;
+  if i.settled_amount > 0 then
+    raise exception 'على الفاتورة سداد — ألغِ الدفعات أولاً';
+  end if;
+  if exists (select 1 from public.supplier_invoice_items l join public.goods_receipt_items gi on gi.id = l.receipt_item_id
+              where l.invoice_id = p_id and gi.qty_returned > gi.qty_invoiced - l.qty) then
+    raise exception 'أُرجع جزء من هذه البضاعة للمورد — عالج المرتجع أولاً';
+  end if;
+
+  perform set_config('app.po_rpc', 'on', true);
+  for r in select l.*, gi.purchase_item_id, gi.unit_cost as grn_cost
+             from public.supplier_invoice_items l join public.goods_receipt_items gi on gi.id = l.receipt_item_id
+            where l.invoice_id = p_id loop
+    update public.goods_receipt_items set qty_invoiced = qty_invoiced - r.qty where id = r.receipt_item_id;
+    update public.purchase_items set qty_invoiced = qty_invoiced - r.qty where id = r.purchase_item_id;
+    perform public._apply_cost_adjustment(r.variant_id, r.qty, -round(r.qty * (r.unit_cost - r.grn_cost), 2), 'invoice_void', p_id);
+  end loop;
+  perform set_config('app.po_rpc', '', true);
+
+  update public.supplier_invoices set status = 'void', void_reason = trim(p_reason), voided_by = auth.uid(), voided_at = now()
+   where id = p_id;
+  perform public._ap_post(i.supplier_id, 'void_invoice', p_id, coalesce(i.supplier_invoice_no, i.doc_no), i.total, 0,
+                          'إلغاء: ' || trim(p_reason));
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- شراء مباشر بدون أمر شراء مسبق: أمر شراء + استلام كامل + فاتورة مرحّلة (+ سداد) في عملية واحدة
+-- ---------------------------------------------------------------------
+create or replace function public.create_direct_purchase(
+  p_supplier uuid, p_location uuid, p_items jsonb, p_supplier_invoice_no text, p_invoice_date date,
+  p_payment_terms public.ap_payment_terms, p_payment jsonb default null, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_po uuid;
+  v_grn uuid;
+  v_inv uuid;
+  e jsonb;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('direct:' || p_client_ref::text, 0));
+    select id into v_inv from public.supplier_invoices where client_ref = p_client_ref;
+    if v_inv is not null then
+      return v_inv;
+    end if;
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'لا توجد أصناف';
+  end if;
+  perform public._lock_supplier(p_supplier);
+  insert into public.purchase_orders (po_no, supplier_id, status, supplier_invoice_no, notes, location_id, approved_by, approved_at)
+  values (public.next_po_no(), p_supplier, 'ordered', nullif(trim(p_supplier_invoice_no), ''),
+          coalesce(nullif(trim(p_notes), ''), 'شراء مباشر'), p_location, auth.uid(), now())
+  returning id into v_po;
+  for e in select * from jsonb_array_elements(p_items) loop
+    if coalesce((e ->> 'qty')::integer, 0) <= 0 or coalesce((e ->> 'unit_cost')::numeric, -1) < 0 then
+      raise exception 'كمية أو سعر غير صحيح';
+    end if;
+    insert into public.purchase_items (purchase_id, variant_id, qty, unit_cost)
+    values (v_po, (e ->> 'variant_id')::uuid, (e ->> 'qty')::integer, (e ->> 'unit_cost')::numeric);
+  end loop;
+  v_grn := public.receive_goods(v_po, null, 'شراء مباشر', null);
+  v_inv := public.save_supplier_invoice(
+    null, p_supplier, v_po, p_supplier_invoice_no, p_invoice_date, null, p_payment_terms,
+    (select jsonb_agg(jsonb_build_object('receipt_item_id', gi.id, 'qty', gi.qty, 'unit_cost', gi.unit_cost))
+       from public.goods_receipt_items gi where gi.receipt_id = v_grn),
+    p_notes, p_client_ref);
+  perform public.post_supplier_invoice(v_inv, null, p_payment);
+  return v_inv;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- المرفقات: تسجيل ملف مرفوع إلى purchase-docs/<owner_type>/<owner_id>/…
+-- ---------------------------------------------------------------------
+create or replace function public.add_purchase_attachment(
+  p_owner_type text, p_owner_id uuid, p_path text, p_name text, p_mime text, p_size integer
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_path is null or split_part(p_path, '/', 1) <> p_owner_type or split_part(p_path, '/', 2) <> p_owner_id::text then
+    raise exception 'مسار الملف لا يطابق المستند';
+  end if;
+  if p_mime not in ('application/pdf', 'image/jpeg', 'image/png', 'image/webp') then
+    raise exception 'نوع الملف غير مسموح (PDF أو صورة فقط)';
+  end if;
+  insert into public.purchase_attachments (owner_type, owner_id, file_path, file_name, mime_type, size_bytes)
+  values (p_owner_type, p_owner_id, p_path, left(coalesce(nullif(trim(p_name), ''), 'file'), 200), p_mime, p_size)
+  on conflict (file_path) do update set file_name = excluded.file_name
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+
+-- فرق التكلفة (نصيب ما بيع قبل وصول الفاتورة/التكاليف) لفترة — يظهر في لوحة المشتريات والتقارير
+create or replace function public.cost_variance_summary(p_from date, p_to date)
+returns table (source_type text, adjustments integer, total_delta numeric, stock_delta numeric, variance_delta numeric)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+    select c.source_type, count(*)::integer, sum(c.total_delta), sum(c.stock_delta), sum(c.variance_delta)
+      from public.cost_adjustments c
+     where (c.posted_at at time zone 'Asia/Riyadh')::date between p_from and p_to
+     group by 1 order by 1;
+end;
+$$;
+
+-- الكمية المطلوبة من المورد ولم تصل: المتبقي من المسودة والمرسل والمستلم جزئياً
+create or replace function public._open_po_qty()
+returns table (loc uuid, variant_id uuid, qty integer)
+language sql stable security definer set search_path = public as $$
+  select coalesce(po.location_id, public._default_location()), pi.variant_id, sum(pi.qty - pi.qty_received)::integer
+    from public.purchase_items pi join public.purchase_orders po on po.id = pi.purchase_id
+   where po.status::text in ('draft', 'ordered', 'partially_received') and pi.qty > pi.qty_received
+   group by 1, 2
+$$;
+
+-- ---------------------------------------------------------------------
+-- الصلاحيات
+-- ---------------------------------------------------------------------
+alter table public.goods_receipts enable row level security;
+alter table public.goods_receipt_items enable row level security;
+alter table public.supplier_invoice_items enable row level security;
+alter table public.cost_adjustments enable row level security;
+alter table public.purchase_attachments enable row level security;
+
+revoke all on public.goods_receipts, public.goods_receipt_items, public.supplier_invoice_items,
+  public.cost_adjustments, public.purchase_attachments from anon, authenticated;
+revoke usage on sequence public.goods_receipt_seq from anon;
+grant select on public.goods_receipts, public.goods_receipt_items, public.supplier_invoice_items,
+  public.cost_adjustments, public.purchase_attachments to authenticated;
+
+create policy goods_receipts_select on public.goods_receipts for select to authenticated using (public.is_manager());
+create policy goods_receipt_items_select on public.goods_receipt_items for select to authenticated using (public.is_manager());
+create policy supplier_invoice_items_select on public.supplier_invoice_items for select to authenticated using (public.is_manager());
+create policy cost_adjustments_select on public.cost_adjustments for select to authenticated using (public.is_manager());
+create policy purchase_attachments_select on public.purchase_attachments for select to authenticated using (public.is_manager());
+
+create trigger goods_receipts_audit after insert or update or delete on public.goods_receipts
+  for each row execute function public.audit_trigger();
+create trigger supplier_invoice_items_audit after insert or update or delete on public.supplier_invoice_items
+  for each row execute function public.audit_trigger();
+create trigger purchase_attachments_audit after insert or update or delete on public.purchase_attachments
+  for each row execute function public.audit_trigger();
+
+revoke all on function
+  public.purchase_order_guard(), public.purchase_item_guard(),
+  public._apply_cost_adjustment(uuid, integer, numeric, text, uuid), public._vat_rate_for(uuid)
+from public, anon, authenticated;
+
+revoke execute on function
+  public.approve_purchase_order(uuid), public.close_purchase_order(uuid, text),
+  public.receive_goods(uuid, jsonb, text, uuid),
+  public.save_supplier_invoice(uuid, uuid, uuid, text, date, date, public.ap_payment_terms, jsonb, text, uuid),
+  public.match_invoice(uuid), public.post_supplier_invoice(uuid, text, jsonb), public.void_supplier_invoice(uuid, text),
+  public.create_direct_purchase(uuid, uuid, jsonb, text, date, public.ap_payment_terms, jsonb, text, uuid),
+  public.add_purchase_attachment(text, uuid, text, text, text, integer), public.cost_variance_summary(date, date)
+from public, anon;
+grant execute on function
+  public.approve_purchase_order(uuid), public.close_purchase_order(uuid, text),
+  public.receive_goods(uuid, jsonb, text, uuid),
+  public.save_supplier_invoice(uuid, uuid, uuid, text, date, date, public.ap_payment_terms, jsonb, text, uuid),
+  public.match_invoice(uuid), public.post_supplier_invoice(uuid, text, jsonb), public.void_supplier_invoice(uuid, text),
+  public.create_direct_purchase(uuid, uuid, jsonb, text, date, public.ap_payment_terms, jsonb, text, uuid),
+  public.add_purchase_attachment(text, uuid, text, text, text, integer), public.cost_variance_summary(date, date)
+to authenticated;
+
+-- =====================================================================
+-- 0019_supplier_returns_landed_cost.sql
+-- =====================================================================
+-- =====================================================================
+-- 0019 مرتجعات الموردين والإشعارات الدائنة وتكاليف الوصول (PR #9 — المرحلة 3)
+--   • مرتجع للمورد: مسودة ← معتمد ← مشحون (يخرج من مخزون موقعه، لا أكثر من المتاح) ← إشعار دائن
+--     يُسعَّر بتكلفة الفاتورة الأصلية (أو الاستلام، أو المتوسط الحالي إن لم يُربط). الفرق عن المتوسط = فرق تكلفة
+--   • إشعار دائن: مرتجع / تعديل سعر (يخفض التكلفة: نصيب المخزون للمتوسط والمباع فرق تكلفة) / خصم (بلا أثر على التكلفة)
+--     ضريبته عكسية، ويُطبَّق على الفواتير (صريح أو الأقدم أولاً) والباقي رصيد دائن لدى المورد
+--   • استرداد من المورد (نقداً/درج/تحويل) يستهلك رصيداً دائناً غير مطبَّق
+--   • تكاليف الوصول (شحن/جمارك/نقل/أخرى): توزيع على سطور الاستلام بالقيمة أو الكمية أو يدوياً، مجموعها يطابق حرفياً
+--     كل سطر له مورد (شركة الشحن، الجمارك…) فيصبح فاتورة مصروف مستحقة عليه
+-- =====================================================================
+
+alter type public.movement_type add value if not exists 'supplier_return';
+alter type public.loc_movement_type add value if not exists 'supplier_return';
+alter type public.ap_entry_type add value if not exists 'void_refund';
+
+alter table public.cost_adjustments drop constraint cost_adjustments_source_type_check;
+alter table public.cost_adjustments add constraint cost_adjustments_source_type_check
+  check (source_type in ('invoice_price', 'invoice_void', 'landed_cost', 'landed_cost_void', 'credit_note', 'credit_note_void',
+                         'supplier_return'));
+
+-- ---------------------------------------------------------------------
+-- المرتجعات
+-- ---------------------------------------------------------------------
+create sequence public.supplier_return_seq start 1;
+create sequence public.supplier_credit_seq start 1;
+create sequence public.supplier_refund_seq start 1;
+create sequence public.landed_cost_seq start 1;
+
+create table public.supplier_returns (
+  id uuid primary key default gen_random_uuid(),
+  return_no text not null unique
+    default 'SRT-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.supplier_return_seq')::text, 5, '0'),
+  supplier_id uuid not null references public.suppliers (id),
+  location_id uuid not null references public.locations (id),
+  status text not null default 'draft' check (status in ('draft', 'approved', 'shipped', 'credited', 'cancelled')),
+  reason text not null check (length(trim(reason)) > 0),
+  notes text,
+  client_ref uuid unique,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  approved_by uuid references public.profiles (id),
+  approved_at timestamptz,
+  shipped_by uuid references public.profiles (id),
+  shipped_at timestamptz,
+  cancel_reason text
+);
+create index supplier_returns_supplier_idx on public.supplier_returns (supplier_id, status);
+
+create table public.supplier_return_items (
+  id uuid primary key default gen_random_uuid(),
+  return_id uuid not null references public.supplier_returns (id) on delete cascade,
+  receipt_item_id uuid references public.goods_receipt_items (id),
+  variant_id uuid not null references public.product_variants (id),
+  qty integer not null check (qty > 0),
+  unit_cost numeric(12,2) not null check (unit_cost >= 0),        -- أساس الإشعار الدائن (قبل الضريبة)
+  avg_cost_at_ship numeric(12,2)
+);
+create index supplier_return_items_return_idx on public.supplier_return_items (return_id);
+
+-- ---------------------------------------------------------------------
+-- الإشعارات الدائنة والاستردادات
+-- ---------------------------------------------------------------------
+create table public.supplier_credit_notes (
+  id uuid primary key default gen_random_uuid(),
+  cn_no text not null unique
+    default 'SCN-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.supplier_credit_seq')::text, 5, '0'),
+  supplier_id uuid not null references public.suppliers (id),
+  kind text not null check (kind in ('return', 'price', 'rebate')),
+  status text not null default 'posted' check (status in ('posted', 'void')),
+  supplier_credit_no text,
+  credit_date date not null default (now() at time zone 'Asia/Riyadh')::date,
+  return_id uuid references public.supplier_returns (id),
+  invoice_id uuid references public.supplier_invoices (id),
+  subtotal numeric(12,2) not null check (subtotal >= 0),
+  vat_amount numeric(12,2) not null default 0 check (vat_amount >= 0),
+  total numeric(12,2) not null check (total > 0),
+  allocated_amount numeric(12,2) not null default 0 check (allocated_amount >= 0),
+  notes text,
+  client_ref uuid unique,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  void_reason text,
+  voided_by uuid references public.profiles (id),
+  voided_at timestamptz,
+  constraint scn_alloc_le_total check (allocated_amount <= total)
+);
+create index supplier_credit_notes_supplier_idx on public.supplier_credit_notes (supplier_id, status);
+create unique index supplier_credit_notes_return_key on public.supplier_credit_notes (return_id) where return_id is not null and status = 'posted';
+
+create table public.supplier_credit_note_items (
+  id uuid primary key default gen_random_uuid(),
+  credit_note_id uuid not null references public.supplier_credit_notes (id) on delete cascade,
+  receipt_item_id uuid references public.goods_receipt_items (id),
+  variant_id uuid references public.product_variants (id),
+  description text,
+  qty integer not null default 1 check (qty > 0),
+  unit_amount numeric(12,2) not null check (unit_amount >= 0),
+  line_total numeric(12,2) not null check (line_total >= 0),
+  vat_rate numeric(5,2) not null default 0,
+  vat_amount numeric(12,2) not null default 0
+);
+create index supplier_credit_note_items_cn_idx on public.supplier_credit_note_items (credit_note_id);
+
+create table public.supplier_refunds (
+  id uuid primary key default gen_random_uuid(),
+  refund_no text not null unique
+    default 'SRF-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.supplier_refund_seq')::text, 5, '0'),
+  supplier_id uuid not null references public.suppliers (id),
+  amount numeric(12,2) not null check (amount > 0),
+  method public.ap_payment_method not null check (method <> 'opening'),
+  reference text,
+  received_at date not null default (now() at time zone 'Asia/Riyadh')::date,
+  shift_id uuid references public.shifts (id),
+  shift_movement_id uuid references public.shift_cash_movements (id),
+  notes text,
+  client_ref uuid unique,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now()
+);
+
+-- الاسترداد يستهلك أرصدة دائنة غير مطبّقة (دفعات مقدمة أو إشعارات)
+create table public.supplier_refund_allocations (
+  id bigint generated always as identity primary key,
+  refund_id uuid not null references public.supplier_refunds (id),
+  supplier_id uuid not null references public.suppliers (id),
+  source_type text not null check (source_type in ('payment', 'credit_note')),
+  source_id uuid not null,
+  amount numeric(12,2) not null check (amount > 0)
+);
+create index supplier_refund_allocations_source_idx on public.supplier_refund_allocations (source_type, source_id);
+
+-- ---------------------------------------------------------------------
+-- تكاليف الوصول
+-- ---------------------------------------------------------------------
+create table public.landed_cost_vouchers (
+  id uuid primary key default gen_random_uuid(),
+  lc_no text not null unique
+    default 'LCV-' || to_char(now() at time zone 'Asia/Riyadh', 'YY') || lpad(nextval('public.landed_cost_seq')::text, 5, '0'),
+  status text not null default 'posted' check (status in ('posted', 'void')),
+  method text not null check (method in ('value', 'qty', 'manual')),
+  total_amount numeric(12,2) not null check (total_amount > 0),
+  notes text,
+  client_ref uuid unique,
+  created_by uuid references public.profiles (id) default auth.uid(),
+  created_at timestamptz not null default now(),
+  void_reason text,
+  voided_by uuid references public.profiles (id),
+  voided_at timestamptz
+);
+
+create table public.landed_cost_lines (
+  id uuid primary key default gen_random_uuid(),
+  voucher_id uuid not null references public.landed_cost_vouchers (id) on delete cascade,
+  cost_type text not null check (cost_type in ('freight', 'customs', 'transport', 'other')),
+  description text,
+  supplier_id uuid not null references public.suppliers (id),
+  supplier_invoice_no text,
+  amount numeric(12,2) not null check (amount > 0),         -- قبل الضريبة: يدخل التكلفة
+  vat_amount numeric(12,2) not null default 0 check (vat_amount >= 0),   -- ضريبة مدخلات: لا تدخل التكلفة
+  expense_invoice_id uuid references public.supplier_invoices (id)
+);
+
+create table public.landed_cost_allocations (
+  id bigint generated always as identity primary key,
+  voucher_id uuid not null references public.landed_cost_vouchers (id) on delete cascade,
+  receipt_item_id uuid not null references public.goods_receipt_items (id),
+  variant_id uuid not null references public.product_variants (id),
+  qty integer not null,
+  basis numeric(14,2) not null,
+  amount numeric(12,2) not null
+);
+create index landed_cost_allocations_voucher_idx on public.landed_cost_allocations (voucher_id);
+create index landed_cost_allocations_gri_idx on public.landed_cost_allocations (receipt_item_id);
+
+-- ---------------------------------------------------------------------
+-- القيد: يشمل الآن الإشعارات والاستردادات
+-- ---------------------------------------------------------------------
+create or replace function public._check_supplier_integrity(p_supplier uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_bal numeric;
+  v_led numeric;
+  r record;
+begin
+  select coalesce((select balance from public.supplier_balances where supplier_id = p_supplier), 0) into v_bal;
+  select coalesce(sum(credit - debit), 0) into v_led from public.supplier_ledger where supplier_id = p_supplier;
+  if v_bal <> v_led then
+    raise exception 'تعارض حساب المورد: الرصيد % والدفتر %', v_bal, v_led;
+  end if;
+  for r in
+    select i.doc_no, i.settled_amount,
+           coalesce((select sum(a.amount) from public.supplier_allocations a where a.invoice_id = i.id and a.voided_at is null), 0) as alloc
+      from public.supplier_invoices i where i.supplier_id = p_supplier
+  loop
+    if r.settled_amount <> r.alloc then
+      raise exception 'تعارض المسدَّد للفاتورة %: % مقابل توزيعات %', r.doc_no, r.settled_amount, r.alloc;
+    end if;
+  end loop;
+  for r in
+    select p.payment_no as no, p.allocated_amount,
+           coalesce((select sum(a.amount) from public.supplier_allocations a
+                      where a.source_type = 'payment' and a.source_id = p.id and a.voided_at is null), 0)
+         + coalesce((select sum(f.amount) from public.supplier_refund_allocations f
+                      where f.source_type = 'payment' and f.source_id = p.id), 0) as alloc
+      from public.supplier_payments p where p.supplier_id = p_supplier
+    union all
+    select c.cn_no, c.allocated_amount,
+           coalesce((select sum(a.amount) from public.supplier_allocations a
+                      where a.source_type = 'credit_note' and a.source_id = c.id and a.voided_at is null), 0)
+         + coalesce((select sum(f.amount) from public.supplier_refund_allocations f
+                      where f.source_type = 'credit_note' and f.source_id = c.id), 0)
+      from public.supplier_credit_notes c where c.supplier_id = p_supplier
+  loop
+    if r.allocated_amount <> r.alloc then
+      raise exception 'تعارض توزيع %: % مقابل %', r.no, r.allocated_amount, r.alloc;
+    end if;
+  end loop;
+end;
+$$;
+
+create constraint trigger supplier_credit_notes_integrity after insert or update on public.supplier_credit_notes
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+create constraint trigger supplier_refund_allocations_integrity after insert on public.supplier_refund_allocations
+  deferrable initially deferred for each row execute function public.supplier_integrity_trigger();
+
+create or replace function public.supplier_credit_notes_open()
+returns table (id uuid, supplier_id uuid, total numeric, allocated_amount numeric)
+language sql stable security definer set search_path = public as $$
+  select c.id, c.supplier_id, c.total, c.allocated_amount from public.supplier_credit_notes c
+   where c.status = 'posted' and c.total > c.allocated_amount
+$$;
+
+-- ---------------------------------------------------------------------
+-- المرتجعات: إنشاء، اعتماد، شحن، إلغاء
+--   p_items: [{receipt_item_id, qty}] أو [{variant_id, qty}] (بلا ربط: بالمتوسط الحالي)
+-- ---------------------------------------------------------------------
+create or replace function public.create_supplier_return(
+  p_supplier uuid, p_location uuid, p_items jsonb, p_reason text, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  e jsonb;
+  g record;
+  v_cost numeric;
+  v_variant uuid;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'سبب الإرجاع مطلوب';
+  end if;
+  if p_items is null or jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'لا توجد أصناف';
+  end if;
+  if p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('srt:' || p_client_ref::text, 0));
+    select id into v_id from public.supplier_returns where client_ref = p_client_ref;
+    if v_id is not null then
+      return v_id;
+    end if;
+  end if;
+  perform public._lock_supplier(p_supplier);
+  if (select kind from public.locations where id = p_location and is_active) not in ('store', 'warehouse') then
+    raise exception 'موقع غير صالح';
+  end if;
+  insert into public.supplier_returns (supplier_id, location_id, reason, notes, client_ref)
+  values (p_supplier, p_location, trim(p_reason), nullif(trim(p_notes), ''), p_client_ref)
+  returning id into v_id;
+
+  for e in select * from jsonb_array_elements(p_items) loop
+    if coalesce((e ->> 'qty')::integer, 0) <= 0 then
+      raise exception 'كمية غير صحيحة';
+    end if;
+    if e ? 'receipt_item_id' then
+      select gi.*, gr.supplier_id as sup into g
+        from public.goods_receipt_items gi join public.goods_receipts gr on gr.id = gi.receipt_id
+       where gi.id = (e ->> 'receipt_item_id')::uuid;
+      if g.id is null or g.sup <> p_supplier then
+        raise exception 'سطر الاستلام لا يخص هذا المورد';
+      end if;
+      -- تكلفة الفاتورة الأصلية إن وُجدت، وإلا تكلفة الاستلام
+      select coalesce((select l.unit_cost from public.supplier_invoice_items l join public.supplier_invoices i on i.id = l.invoice_id
+                        where l.receipt_item_id = g.id and i.status in ('posted', 'partially_paid', 'paid')
+                        order by i.posted_at desc limit 1), g.unit_cost) into v_cost;
+      v_variant := g.variant_id;
+    else
+      v_variant := (e ->> 'variant_id')::uuid;
+      select coalesce(cost_price, 0) into v_cost from public.variant_costs where variant_id = v_variant;
+      if not found then
+        raise exception 'الصنف غير موجود';
+      end if;
+    end if;
+    insert into public.supplier_return_items (return_id, receipt_item_id, variant_id, qty, unit_cost)
+    values (v_id, (e ->> 'receipt_item_id')::uuid, v_variant, (e ->> 'qty')::integer, coalesce(v_cost, 0));
+  end loop;
+  return v_id;
+end;
+$$;
+
+create or replace function public.approve_supplier_return(p_id uuid)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.supplier_returns;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into r from public.supplier_returns where id = p_id for update;
+  if r.id is null or r.status <> 'draft' then
+    raise exception 'المرتجع ليس مسودة';
+  end if;
+  if (select inventory_segregation from public.store_settings where id = 1) and r.created_by = auth.uid() then
+    raise exception 'فصل المهام مفعّل: من أنشأ المرتجع لا يعتمده';
+  end if;
+  update public.supplier_returns set status = 'approved', approved_by = auth.uid(), approved_at = now() where id = p_id;
+end;
+$$;
+
+create or replace function public.cancel_supplier_return(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  update public.supplier_returns set status = 'cancelled', cancel_reason = trim(p_reason)
+   where id = p_id and status in ('draft', 'approved');
+  if not found then
+    raise exception 'لا يمكن إلغاء مرتجع بعد شحنه';
+  end if;
+end;
+$$;
+
+-- الشحن: يخرج من مخزون موقع المرتجع (لا أكثر من الموجود فيه)، مرة واحدة
+create or replace function public.ship_supplier_return(p_id uuid, p_client_ref uuid default null)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  r public.supplier_returns;
+  it record;
+  v_have integer;
+  v_avg numeric;
+begin
+  if not public.is_staff() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into r from public.supplier_returns where id = p_id for update;
+  if r.id is null then
+    raise exception 'المرتجع غير موجود';
+  end if;
+  if r.status <> 'approved' then
+    if r.status in ('shipped', 'credited') then
+      return;       -- ضغطة مكررة: لا أثر
+    end if;
+    raise exception 'المرتجع غير معتمد';
+  end if;
+  if not public.is_manager() and public._my_location() is distinct from r.location_id then
+    raise exception 'الشحن لموظفي موقع المرتجع أو المدير فقط';
+  end if;
+
+  perform set_config('app.po_rpc', 'on', true);
+  for it in select * from public.supplier_return_items where return_id = p_id order by variant_id, id loop
+    -- نفس ترتيب أقفال البيع (الصنف ثم رصيد الموقع) حتى لا يحدث تعارض قفل متبادل
+    perform 1 from public.product_variants where id = it.variant_id for update;
+    select coalesce(qty, 0) into v_have from public.location_stock
+     where location_id = r.location_id and variant_id = it.variant_id for update;
+    if coalesce(v_have, 0) < it.qty then
+      raise exception 'الموجود من % في % هو % فقط',
+        (select sku from public.product_variants where id = it.variant_id),
+        (select name from public.locations where id = r.location_id), coalesce(v_have, 0);
+    end if;
+    if it.receipt_item_id is not null then
+      update public.goods_receipt_items set qty_returned = qty_returned + it.qty where id = it.receipt_item_id;
+      update public.purchase_items set qty_returned = qty_returned + it.qty
+       where id = (select purchase_item_id from public.goods_receipt_items where id = it.receipt_item_id);
+    end if;
+    select coalesce(cost_price, 0) into v_avg from public.variant_costs where variant_id = it.variant_id;
+    update public.supplier_return_items set avg_cost_at_ship = v_avg where id = it.id;
+    perform set_config('app.location_id', r.location_id::text, true);
+    perform public._move_stock(it.variant_id, -it.qty, 'supplier_return', p_id, r.return_no, true);
+    perform set_config('app.location_id', '', true);
+    -- المخزون يخرج بالمتوسط، والإشعار بسعر الشراء: الفرق فرق تكلفة (موجب = خسارة)
+    if v_avg <> it.unit_cost then
+      insert into public.cost_adjustments (variant_id, source_type, source_id, qty_basis, qty_in_stock, total_delta,
+                                           stock_delta, variance_delta, cost_before, cost_after)
+      values (it.variant_id, 'supplier_return', p_id, it.qty, 0, round(it.qty * (v_avg - it.unit_cost), 2), 0,
+              round(it.qty * (v_avg - it.unit_cost), 2), v_avg, v_avg);
+    end if;
+  end loop;
+  perform set_config('app.po_rpc', '', true);
+  update public.supplier_returns set status = 'shipped', shipped_by = auth.uid(), shipped_at = now() where id = p_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الإشعار الدائن
+--   return : من مرتجع مشحون (الكميات والأسعار منه)
+--   price  : [{receipt_item_id, qty, unit_amount}] تخفيض سعر لكل قطعة ← يخفض التكلفة
+--   rebate : [{description, amount}] خصم كمية/تجاري بلا أثر على التكلفة
+--   p_allocations: [{invoice_id, amount}] أو null = الفاتورة المرتبطة ثم الأقدم أولاً
+-- ---------------------------------------------------------------------
+create or replace function public.post_credit_note(
+  p_supplier uuid, p_kind text, p_return_id uuid, p_invoice_id uuid, p_supplier_credit_no text, p_credit_date date,
+  p_lines jsonb default null, p_allocations jsonb default null, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_no text;
+  v_rate numeric := public._vat_rate_for(p_supplier);
+  r public.supplier_returns;
+  e jsonb;
+  g record;
+  v_line numeric;
+  v_sub numeric;
+  v_vat numeric;
+  v_used numeric;
+  v_open numeric;
+  it record;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_kind not in ('return', 'price', 'rebate') then
+    raise exception 'نوع الإشعار غير صحيح';
+  end if;
+  if p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('scn:' || p_client_ref::text, 0));
+    select id into v_id from public.supplier_credit_notes where client_ref = p_client_ref;
+    if v_id is not null then
+      return v_id;
+    end if;
+  end if;
+  perform public._lock_supplier(p_supplier);
+  if p_invoice_id is not null and not exists (select 1 from public.supplier_invoices where id = p_invoice_id and supplier_id = p_supplier) then
+    raise exception 'الفاتورة لا تخص هذا المورد';
+  end if;
+  if p_kind = 'return' then
+    select * into r from public.supplier_returns where id = p_return_id for update;
+    if r.id is null or r.supplier_id <> p_supplier then
+      raise exception 'المرتجع لا يخص هذا المورد';
+    end if;
+    if r.status <> 'shipped' then
+      raise exception 'الإشعار يصدر لمرتجع مشحون ولم يُشعَر به بعد';
+    end if;
+  end if;
+
+  insert into public.supplier_credit_notes (supplier_id, kind, supplier_credit_no, credit_date, return_id, invoice_id,
+                                            subtotal, vat_amount, total, notes, client_ref)
+  values (p_supplier, p_kind, nullif(trim(p_supplier_credit_no), ''), coalesce(p_credit_date, current_date), p_return_id, p_invoice_id,
+          0, 0, 0.01, nullif(trim(p_notes), ''), p_client_ref)
+  returning id, cn_no into v_id, v_no;
+
+  if p_kind = 'return' then
+    insert into public.supplier_credit_note_items (credit_note_id, receipt_item_id, variant_id, qty, unit_amount, line_total, vat_rate, vat_amount)
+    select v_id, ri.receipt_item_id, ri.variant_id, ri.qty, ri.unit_cost, round(ri.qty * ri.unit_cost, 2), v_rate,
+           round(round(ri.qty * ri.unit_cost, 2) * v_rate / 100, 2)
+      from public.supplier_return_items ri where ri.return_id = p_return_id;
+    update public.supplier_returns set status = 'credited' where id = p_return_id;
+  else
+    if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+      raise exception 'الإشعار بدون بنود';
+    end if;
+    for e in select * from jsonb_array_elements(p_lines) loop
+      if p_kind = 'price' then
+        select gi.*, gr.supplier_id as sup into g
+          from public.goods_receipt_items gi join public.goods_receipts gr on gr.id = gi.receipt_id
+         where gi.id = (e ->> 'receipt_item_id')::uuid;
+        if g.id is null or g.sup <> p_supplier then
+          raise exception 'سطر الاستلام لا يخص هذا المورد';
+        end if;
+        if coalesce((e ->> 'qty')::integer, 0) <= 0 or (e ->> 'qty')::integer > g.qty
+           or coalesce((e ->> 'unit_amount')::numeric, 0) <= 0 then
+          raise exception 'كمية أو مبلغ تخفيض غير صحيح';
+        end if;
+        v_line := round((e ->> 'qty')::integer * (e ->> 'unit_amount')::numeric, 2);
+        insert into public.supplier_credit_note_items (credit_note_id, receipt_item_id, variant_id, qty, unit_amount, line_total, vat_rate, vat_amount)
+        values (v_id, g.id, g.variant_id, (e ->> 'qty')::integer, (e ->> 'unit_amount')::numeric, v_line, v_rate, round(v_line * v_rate / 100, 2));
+        perform public._apply_cost_adjustment(g.variant_id, (e ->> 'qty')::integer, -v_line, 'credit_note', v_id);
+      else
+        v_line := round(coalesce((e ->> 'amount')::numeric, 0), 2);
+        if v_line <= 0 or coalesce(trim(e ->> 'description'), '') = '' then
+          raise exception 'أدخل وصف ومبلغ الخصم';
+        end if;
+        insert into public.supplier_credit_note_items (credit_note_id, description, qty, unit_amount, line_total, vat_rate, vat_amount)
+        values (v_id, trim(e ->> 'description'), 1, v_line, v_line, v_rate, round(v_line * v_rate / 100, 2));
+      end if;
+    end loop;
+  end if;
+
+  select coalesce(sum(line_total), 0), coalesce(sum(vat_amount), 0) into v_sub, v_vat
+    from public.supplier_credit_note_items where credit_note_id = v_id;
+  if v_sub <= 0 then
+    raise exception 'الإشعار بدون مبلغ';
+  end if;
+  update public.supplier_credit_notes set subtotal = v_sub, vat_amount = v_vat, total = v_sub + v_vat where id = v_id;
+  perform public._ap_post(p_supplier, 'credit_note', v_id, coalesce(nullif(trim(p_supplier_credit_no), ''), v_no), v_sub + v_vat, 0,
+                          v_no, coalesce(p_credit_date, current_date));
+
+  -- التطبيق: صريح، أو الفاتورة المرتبطة أولاً ثم الأقدم
+  v_used := 0;
+  if p_allocations is null and p_invoice_id is not null then
+    select total - settled_amount into v_open from public.supplier_invoices
+     where id = p_invoice_id and status in ('posted', 'partially_paid');
+    if coalesce(v_open, 0) > 0 then
+      v_used := public._ap_allocate(p_supplier, 'credit_note', v_id, least(v_open, v_sub + v_vat),
+                                    jsonb_build_array(jsonb_build_object('invoice_id', p_invoice_id, 'amount', least(v_open, v_sub + v_vat))));
+    end if;
+  end if;
+  v_used := v_used + public._ap_allocate(p_supplier, 'credit_note', v_id, v_sub + v_vat - v_used, p_allocations);
+  update public.supplier_credit_notes set allocated_amount = v_used where id = v_id;
+  return v_id;
+end;
+$$;
+
+-- إلغاء إشعار: يحرر توزيعاته ويعكس أثر التكلفة، ويعيد المرتجع لحالة «مشحون»
+create or replace function public.void_credit_note(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  c public.supplier_credit_notes;
+  a record;
+  it record;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  select * into c from public.supplier_credit_notes where id = p_id;
+  if c.id is null then
+    raise exception 'الإشعار غير موجود';
+  end if;
+  perform public._lock_supplier(c.supplier_id);
+  select * into c from public.supplier_credit_notes where id = p_id for update;
+  if c.status = 'void' then
+    raise exception 'الإشعار ملغى مسبقاً';
+  end if;
+  if exists (select 1 from public.supplier_refund_allocations where source_type = 'credit_note' and source_id = p_id) then
+    raise exception 'استُرد جزء من هذا الإشعار نقداً — لا يمكن إلغاؤه';
+  end if;
+  for a in select * from public.supplier_allocations where source_type = 'credit_note' and source_id = p_id and voided_at is null for update loop
+    update public.supplier_allocations set voided_at = now() where id = a.id;
+    update public.supplier_invoices set settled_amount = settled_amount - a.amount where id = a.invoice_id;
+    perform public._invoice_refresh_status(a.invoice_id);
+  end loop;
+  if c.kind = 'price' then
+    for it in select * from public.supplier_credit_note_items where credit_note_id = p_id loop
+      perform public._apply_cost_adjustment(it.variant_id, it.qty, it.line_total, 'credit_note_void', p_id);
+    end loop;
+  end if;
+  if c.kind = 'return' then
+    update public.supplier_returns set status = 'shipped' where id = c.return_id;
+  end if;
+  update public.supplier_credit_notes
+     set status = 'void', allocated_amount = 0, void_reason = trim(p_reason), voided_by = auth.uid(), voided_at = now()
+   where id = p_id;
+  perform public._ap_post(c.supplier_id, 'void_credit_note', p_id, c.cn_no, 0, c.total, 'إلغاء: ' || trim(p_reason));
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- استرداد من المورد: يستهلك الأرصدة الدائنة غير المطبقة (الأقدم أولاً)
+-- ---------------------------------------------------------------------
+create or replace function public.record_supplier_refund(
+  p_supplier uuid, p_amount numeric, p_method public.ap_payment_method, p_reference text default null,
+  p_received_at date default null, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_no text;
+  v_left numeric := p_amount;
+  v_take numeric;
+  v_shift uuid;
+  v_mv uuid;
+  src record;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(p_amount, 0) <= 0 or p_method = 'opening' then
+    raise exception 'مبلغ أو طريقة غير صحيحة';
+  end if;
+  if p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('srf:' || p_client_ref::text, 0));
+    select id into v_id from public.supplier_refunds where client_ref = p_client_ref;
+    if v_id is not null then
+      return v_id;
+    end if;
+  end if;
+  perform public._lock_supplier(p_supplier);
+  if p_amount > coalesce((select sum(amount - allocated_amount) from public.supplier_payments where supplier_id = p_supplier and not is_void), 0)
+               + coalesce((select sum(total - allocated_amount) from public.supplier_credit_notes where supplier_id = p_supplier and status = 'posted'), 0) then
+    raise exception 'الاسترداد أكبر من الرصيد الدائن غير المطبّق لدى المورد';
+  end if;
+  insert into public.supplier_refunds (supplier_id, amount, method, reference, received_at, notes, client_ref)
+  values (p_supplier, p_amount, p_method, nullif(trim(p_reference), ''), coalesce(p_received_at, current_date), nullif(trim(p_notes), ''), p_client_ref)
+  returning id, refund_no into v_id, v_no;
+
+  if p_method = 'cash_drawer' then
+    select id into v_shift from public.shifts where cashier_id = auth.uid() and status = 'open' for update;
+    if v_shift is null then
+      raise exception 'لا توجد لديك وردية مفتوحة للإيداع في الدرج';
+    end if;
+    insert into public.shift_cash_movements (shift_id, type, amount, reason)
+    values (v_shift, 'in', p_amount, 'استرداد من مورد ' || v_no)
+    returning id into v_mv;
+    update public.supplier_refunds set shift_id = v_shift, shift_movement_id = v_mv where id = v_id;
+  end if;
+
+  for src in
+    select 'payment' as t, id, amount - allocated_amount as free, created_at from public.supplier_payments
+     where supplier_id = p_supplier and not is_void and amount > allocated_amount
+    union all
+    select 'credit_note', id, total - allocated_amount, created_at from public.supplier_credit_notes
+     where supplier_id = p_supplier and status = 'posted' and total > allocated_amount
+    order by created_at
+  loop
+    exit when v_left <= 0;
+    v_take := least(v_left, src.free);
+    insert into public.supplier_refund_allocations (refund_id, supplier_id, source_type, source_id, amount)
+    values (v_id, p_supplier, src.t, src.id, v_take);
+    if src.t = 'payment' then
+      update public.supplier_payments set allocated_amount = allocated_amount + v_take where id = src.id;
+    else
+      update public.supplier_credit_notes set allocated_amount = allocated_amount + v_take where id = src.id;
+    end if;
+    v_left := v_left - v_take;
+  end loop;
+  perform public._ap_post(p_supplier, 'refund', v_id, v_no, 0, p_amount, nullif(trim(p_notes), ''), coalesce(p_received_at, current_date));
+  return v_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- تكاليف الوصول
+--   p_lines: [{cost_type, description, amount, vat_amount?, supplier_id, supplier_invoice_no?}]
+--   p_method: value (بقيمة الاستلام) / qty (بالكمية) / manual (p_manual: [{receipt_item_id, amount}] مجموعه = الإجمالي)
+-- ---------------------------------------------------------------------
+create or replace function public.landed_cost_preview(p_receipts uuid[], p_total numeric, p_method text, p_manual jsonb default null)
+returns table (receipt_item_id uuid, variant_id uuid, sku text, qty integer, basis numeric, amount numeric, per_unit numeric)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_method not in ('value', 'qty', 'manual') then
+    raise exception 'طريقة توزيع غير صحيحة';
+  end if;
+  return query
+  with lines as (
+    select gi.id, gi.variant_id, v.sku, gi.qty,
+           case p_method when 'value' then round(gi.qty * gi.unit_cost, 2) when 'qty' then gi.qty::numeric
+                else coalesce((select sum((e ->> 'amount')::numeric) from jsonb_array_elements(coalesce(p_manual, '[]')) e
+                                where (e ->> 'receipt_item_id')::uuid = gi.id), 0) end as basis,
+           row_number() over (order by gi.id) as rn, count(*) over () as n
+      from public.goods_receipt_items gi join public.product_variants v on v.id = gi.variant_id
+     where gi.receipt_id = any(p_receipts)
+  ),
+  tot as (select sum(basis) as b from lines),
+  shares as (
+    select l.*, case when p_method = 'manual' then l.basis
+                     when (select b from tot) > 0 then round(p_total * l.basis / (select b from tot), 2) else 0 end as share
+      from lines l
+  )
+  -- التقريب: آخر سطر يأخذ الفرق حتى يطابق المجموع الإجمالي حرفياً
+  select s.id, s.variant_id, s.sku, s.qty, s.basis,
+         case when s.rn = s.n and p_method <> 'manual' then p_total - coalesce(sum(s.share) filter (where s.rn < s.n) over (), 0) else s.share end,
+         round(case when s.rn = s.n and p_method <> 'manual' then p_total - coalesce(sum(s.share) filter (where s.rn < s.n) over (), 0) else s.share end / s.qty, 4)
+    from shares s order by s.rn;
+end;
+$$;
+
+create or replace function public.post_landed_cost(
+  p_receipts uuid[], p_lines jsonb, p_method text, p_manual jsonb default null, p_notes text default null, p_client_ref uuid default null
+) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_no text;
+  v_total numeric;
+  e jsonb;
+  v_line uuid;
+  v_vat numeric;
+  a record;
+  grp record;
+  v_inv uuid;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_client_ref is not null then
+    perform pg_advisory_xact_lock(hashtextextended('lcv:' || p_client_ref::text, 0));
+    select id into v_id from public.landed_cost_vouchers where client_ref = p_client_ref;
+    if v_id is not null then
+      return v_id;
+    end if;
+  end if;
+  if p_receipts is null or cardinality(p_receipts) = 0
+     or exists (select 1 from unnest(p_receipts) x where not exists (select 1 from public.goods_receipts where id = x)) then
+    raise exception 'اختر سندات استلام صحيحة';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'أدخل بنود التكاليف';
+  end if;
+  select sum(round((x ->> 'amount')::numeric, 2)) into v_total from jsonb_array_elements(p_lines) x;
+  if coalesce(v_total, 0) <= 0 or exists (select 1 from jsonb_array_elements(p_lines) x
+                                           where coalesce((x ->> 'amount')::numeric, 0) <= 0 or (x ->> 'supplier_id') is null) then
+    raise exception 'كل بند يحتاج مبلغاً ومورداً (شركة الشحن، الجمارك…)';
+  end if;
+  if p_method = 'manual' and coalesce((select sum((m ->> 'amount')::numeric) from jsonb_array_elements(coalesce(p_manual, '[]')) m), 0) <> v_total then
+    raise exception 'مجموع التوزيع اليدوي لا يساوي إجمالي التكاليف (%)', v_total;
+  end if;
+
+  insert into public.landed_cost_vouchers (method, total_amount, notes, client_ref)
+  values (p_method, v_total, nullif(trim(p_notes), ''), p_client_ref)
+  returning id, lc_no into v_id, v_no;
+
+  for e in select * from jsonb_array_elements(p_lines) loop
+    v_vat := coalesce((e ->> 'vat_amount')::numeric,
+                      round(round((e ->> 'amount')::numeric, 2) * public._vat_rate_for((e ->> 'supplier_id')::uuid) / 100, 2));
+    insert into public.landed_cost_lines (voucher_id, cost_type, description, supplier_id, supplier_invoice_no, amount, vat_amount)
+    values (v_id, coalesce(e ->> 'cost_type', 'other'), nullif(trim(e ->> 'description'), ''), (e ->> 'supplier_id')::uuid,
+            nullif(trim(e ->> 'supplier_invoice_no'), ''), round((e ->> 'amount')::numeric, 2), v_vat);
+  end loop;
+
+  -- التوزيع على سطور الاستلام وتعديل التكلفة
+  for a in select * from public.landed_cost_preview(p_receipts, v_total, p_method, p_manual) loop
+    insert into public.landed_cost_allocations (voucher_id, receipt_item_id, variant_id, qty, basis, amount)
+    values (v_id, a.receipt_item_id, a.variant_id, a.qty, a.basis, a.amount);
+    perform public._apply_cost_adjustment(a.variant_id, a.qty, a.amount, 'landed_cost', v_id);
+  end loop;
+  if (select sum(amount) from public.landed_cost_allocations where voucher_id = v_id) <> v_total then
+    raise exception 'التوزيع لا يطابق الإجمالي';
+  end if;
+
+  -- فاتورة مصروف مستحقة لكل مورد تكلفة (ورقم فاتورته)
+  for grp in
+    select supplier_id, supplier_invoice_no, sum(amount) as sub, sum(vat_amount) as vat
+      from public.landed_cost_lines where voucher_id = v_id group by 1, 2
+  loop
+    perform public._lock_supplier(grp.supplier_id);
+    insert into public.supplier_invoices (supplier_id, kind, status, supplier_invoice_no, invoice_date, due_date, payment_terms,
+                                          subtotal, vat_amount, total, notes, match_status, posted_by, posted_at)
+    values (grp.supplier_id, 'expense', 'posted', grp.supplier_invoice_no, current_date,
+            current_date + (select payment_terms_days from public.suppliers where id = grp.supplier_id), 'credit',
+            grp.sub, grp.vat, grp.sub + grp.vat, 'تكاليف وصول ' || v_no, 'not_required', auth.uid(), now())
+    returning id into v_inv;
+    insert into public.supplier_invoice_items (invoice_id, description, qty, unit_cost, line_total, vat_rate, vat_amount)
+    select v_inv, coalesce(l.description, l.cost_type), 1, l.amount, l.amount,
+           case when l.amount > 0 then round(l.vat_amount / l.amount * 100, 2) else 0 end, l.vat_amount
+      from public.landed_cost_lines l
+     where l.voucher_id = v_id and l.supplier_id = grp.supplier_id and l.supplier_invoice_no is not distinct from grp.supplier_invoice_no;
+    update public.landed_cost_lines set expense_invoice_id = v_inv
+     where voucher_id = v_id and supplier_id = grp.supplier_id and supplier_invoice_no is not distinct from grp.supplier_invoice_no;
+    perform public._ap_post(grp.supplier_id, 'invoice', v_inv, coalesce(grp.supplier_invoice_no, v_no), 0, grp.sub + grp.vat,
+                            'تكاليف وصول ' || v_no);
+  end loop;
+  return v_id;
+end;
+$$;
+
+create or replace function public.void_landed_cost(p_id uuid, p_reason text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v public.landed_cost_vouchers;
+  a record;
+  li record;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'السبب مطلوب';
+  end if;
+  select * into v from public.landed_cost_vouchers where id = p_id for update;
+  if v.id is null or v.status = 'void' then
+    raise exception 'السند غير موجود أو ملغى';
+  end if;
+  if exists (select 1 from public.landed_cost_lines l join public.supplier_invoices i on i.id = l.expense_invoice_id
+              where l.voucher_id = p_id and i.settled_amount > 0) then
+    raise exception 'سُدد جزء من فواتير هذه التكاليف — ألغِ الدفعات أولاً';
+  end if;
+  for a in select * from public.landed_cost_allocations where voucher_id = p_id loop
+    perform public._apply_cost_adjustment(a.variant_id, a.qty, -a.amount, 'landed_cost_void', p_id);
+  end loop;
+  for li in select distinct expense_invoice_id from public.landed_cost_lines where voucher_id = p_id and expense_invoice_id is not null loop
+    perform public.void_supplier_invoice(li.expense_invoice_id, 'إلغاء تكاليف وصول ' || v.lc_no || ': ' || trim(p_reason));
+  end loop;
+  update public.landed_cost_vouchers set status = 'void', void_reason = trim(p_reason), voided_by = auth.uid(), voided_at = now()
+   where id = p_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الصلاحيات
+-- ---------------------------------------------------------------------
+alter table public.supplier_returns enable row level security;
+alter table public.supplier_return_items enable row level security;
+alter table public.supplier_credit_notes enable row level security;
+alter table public.supplier_credit_note_items enable row level security;
+alter table public.supplier_refunds enable row level security;
+alter table public.supplier_refund_allocations enable row level security;
+alter table public.landed_cost_vouchers enable row level security;
+alter table public.landed_cost_lines enable row level security;
+alter table public.landed_cost_allocations enable row level security;
+
+revoke all on public.supplier_returns, public.supplier_return_items, public.supplier_credit_notes, public.supplier_credit_note_items,
+  public.supplier_refunds, public.supplier_refund_allocations, public.landed_cost_vouchers, public.landed_cost_lines,
+  public.landed_cost_allocations from anon, authenticated;
+revoke usage on sequence public.supplier_return_seq, public.supplier_credit_seq, public.supplier_refund_seq, public.landed_cost_seq from anon;
+grant select on public.supplier_returns, public.supplier_return_items, public.supplier_credit_notes, public.supplier_credit_note_items,
+  public.supplier_refunds, public.supplier_refund_allocations, public.landed_cost_vouchers, public.landed_cost_lines,
+  public.landed_cost_allocations to authenticated;
+
+create policy supplier_returns_select on public.supplier_returns for select to authenticated using (public.is_manager());
+create policy supplier_return_items_select on public.supplier_return_items for select to authenticated using (public.is_manager());
+create policy supplier_credit_notes_select on public.supplier_credit_notes for select to authenticated using (public.is_manager());
+create policy supplier_credit_note_items_select on public.supplier_credit_note_items for select to authenticated using (public.is_manager());
+create policy supplier_refunds_select on public.supplier_refunds for select to authenticated using (public.is_manager());
+create policy supplier_refund_allocations_select on public.supplier_refund_allocations for select to authenticated using (public.is_manager());
+create policy landed_cost_vouchers_select on public.landed_cost_vouchers for select to authenticated using (public.is_manager());
+create policy landed_cost_lines_select on public.landed_cost_lines for select to authenticated using (public.is_manager());
+create policy landed_cost_allocations_select on public.landed_cost_allocations for select to authenticated using (public.is_manager());
+
+create trigger supplier_returns_audit after insert or update or delete on public.supplier_returns
+  for each row execute function public.audit_trigger();
+create trigger supplier_credit_notes_audit after insert or update or delete on public.supplier_credit_notes
+  for each row execute function public.audit_trigger();
+create trigger supplier_refunds_audit after insert or update or delete on public.supplier_refunds
+  for each row execute function public.audit_trigger();
+create trigger landed_cost_vouchers_audit after insert or update or delete on public.landed_cost_vouchers
+  for each row execute function public.audit_trigger();
+
+revoke execute on function
+  public.create_supplier_return(uuid, uuid, jsonb, text, text, uuid), public.approve_supplier_return(uuid),
+  public.cancel_supplier_return(uuid, text), public.ship_supplier_return(uuid, uuid),
+  public.post_credit_note(uuid, text, uuid, uuid, text, date, jsonb, jsonb, text, uuid), public.void_credit_note(uuid, text),
+  public.record_supplier_refund(uuid, numeric, public.ap_payment_method, text, date, text, uuid),
+  public.landed_cost_preview(uuid[], numeric, text, jsonb), public.post_landed_cost(uuid[], jsonb, text, jsonb, text, uuid),
+  public.void_landed_cost(uuid, text)
+from public, anon;
+grant execute on function
+  public.create_supplier_return(uuid, uuid, jsonb, text, text, uuid), public.approve_supplier_return(uuid),
+  public.cancel_supplier_return(uuid, text), public.ship_supplier_return(uuid, uuid),
+  public.post_credit_note(uuid, text, uuid, uuid, text, date, jsonb, jsonb, text, uuid), public.void_credit_note(uuid, text),
+  public.record_supplier_refund(uuid, numeric, public.ap_payment_method, text, date, text, uuid),
+  public.landed_cost_preview(uuid[], numeric, text, jsonb), public.post_landed_cost(uuid[], jsonb, text, jsonb, text, uuid),
+  public.void_landed_cost(uuid, text)
+to authenticated;
+
+-- =====================================================================
+-- 0020_supplier_intelligence.sql
+-- =====================================================================
+-- =====================================================================
+-- 0020 ذكاء الموردين ولوحة المشتريات (PR #9 — المرحلة 4)
+--   • تاريخ الأسعار من الفواتير المرحّلة: سعر الفاتورة + نصيب القطعة من تكاليف الوصول (التكلفة الواصلة)
+--     (محسوب من المستندات مباشرة فلا يحتاج مزامنة)
+--   • كتالوج المورد (اختياري): رمز الصنف عنده، الحد الأدنى، مضاعف العبوة، السعر المتفق عليه، مدة التوريد
+--   • تقييم المورد لكل صنف: التكلفة الواصلة 50% + مدة التوريد الفعلية 20% + نسبة التوريد 15% + الجودة (1 − المرتجع) 15%
+--     الأوزان من الإعدادات. مورد بلا مشتريات سابقة لهذا الموديل = «بيانات غير كافية» ولا يُرشَّح تلقائياً
+--   • suggest_supplier مع «لماذا؟» بالأرقام، ومقارنة الأسعار، ولوحة المستحقات والمشتريات
+--   • التكامل مع #8: مركز القرارات يقدّم النقل الداخلي، والمتبقي فقط يُشترى من المورد المقترح
+--     create_purchase_drafts_by_supplier تجمّع المسودات حسب المورد وموقع الاستلام (بمفتاح منع تكرار)
+--   • مساعد الشراء (0008) يحتسب المتبقي من أوامر الشراء المستلمة جزئياً
+-- =====================================================================
+
+alter table public.store_settings
+  add column supplier_weight_price integer not null default 50 check (supplier_weight_price between 0 and 100),
+  add column supplier_weight_lead integer not null default 20 check (supplier_weight_lead between 0 and 100),
+  add column supplier_weight_fill integer not null default 15 check (supplier_weight_fill between 0 and 100),
+  add column supplier_weight_quality integer not null default 15 check (supplier_weight_quality between 0 and 100),
+  add constraint supplier_weights_sum check (supplier_weight_price + supplier_weight_lead + supplier_weight_fill + supplier_weight_quality = 100);
+
+create table public.supplier_items (
+  id uuid primary key default gen_random_uuid(),
+  supplier_id uuid not null references public.suppliers (id) on delete cascade,
+  variant_id uuid not null references public.product_variants (id) on delete cascade,
+  supplier_sku text,
+  agreed_cost numeric(12,2) check (agreed_cost is null or agreed_cost >= 0),
+  min_order_qty integer check (min_order_qty is null or min_order_qty > 0),
+  pack_size integer check (pack_size is null or pack_size > 0),
+  lead_time_days integer check (lead_time_days is null or lead_time_days between 0 and 365),
+  is_preferred boolean not null default false,
+  updated_at timestamptz not null default now(),
+  unique (supplier_id, variant_id)
+);
+create index supplier_items_variant_idx on public.supplier_items (variant_id);
+create trigger supplier_items_touch before update on public.supplier_items
+  for each row execute function public.touch_updated_at();
+
+-- ---------------------------------------------------------------------
+-- نقاط السعر: كل سطر فاتورة مرحّل + نصيب القطعة من تكاليف الوصول غير الملغاة
+-- ---------------------------------------------------------------------
+create or replace function public._supplier_price_points()
+returns table (supplier_id uuid, variant_id uuid, product_id uuid, invoice_id uuid, invoice_date date, qty integer,
+               unit_cost numeric, landed_unit numeric, seq text)
+language sql stable security definer set search_path = public as $$
+  select i.supplier_id, l.variant_id, v.product_id, i.id, i.invoice_date, l.qty, l.unit_cost,
+         round(l.unit_cost + coalesce((select sum(a.amount) from public.landed_cost_allocations a
+                                         join public.landed_cost_vouchers lv on lv.id = a.voucher_id and lv.status = 'posted'
+                                        where a.receipt_item_id = l.receipt_item_id), 0) / gi.qty, 2),
+         -- ترتيب زمني ثابت حتى لفاتورتين في نفس اليوم
+         to_char(i.invoice_date, 'YYYYMMDD') || to_char(i.posted_at, 'HH24MISSUS') || i.doc_no
+    from public.supplier_invoice_items l
+    join public.supplier_invoices i on i.id = l.invoice_id and i.status in ('posted', 'partially_paid', 'paid') and i.kind = 'purchase'
+    join public.goods_receipt_items gi on gi.id = l.receipt_item_id
+    join public.product_variants v on v.id = l.variant_id
+$$;
+
+create or replace function public.supplier_price_history(p_variant uuid default null, p_product uuid default null, p_days integer default 365)
+returns table (supplier_id uuid, supplier_name text, variant_id uuid, sku text, invoice_id uuid, doc_no text, invoice_date date,
+               qty integer, unit_cost numeric, landed_unit numeric, change_pct numeric)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+    select p.supplier_id, s.name, p.variant_id, v.sku, p.invoice_id, i.doc_no, p.invoice_date, p.qty, p.unit_cost, p.landed_unit,
+           round((p.unit_cost - lag(p.unit_cost) over w) / nullif(lag(p.unit_cost) over w, 0) * 100, 1)
+      from public._supplier_price_points() p
+      join public.suppliers s on s.id = p.supplier_id
+      join public.product_variants v on v.id = p.variant_id
+      join public.supplier_invoices i on i.id = p.invoice_id
+     where (p_variant is null or p.variant_id = p_variant) and (p_product is null or p.product_id = p_product)
+       and p.invoice_date >= current_date - p_days
+    window w as (partition by p.supplier_id, p.variant_id order by p.seq)
+     order by p.invoice_date desc, s.name;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- أداء المورد (على مستوى المورد، آخر 365 يوماً)
+-- ---------------------------------------------------------------------
+create or replace function public._supplier_performance()
+returns table (supplier_id uuid, lead_days numeric, fill_rate numeric, return_rate numeric, price_adherence numeric,
+               pos integer, receipts integer)
+language sql stable security definer set search_path = public as $$
+  with po as (
+    select po.supplier_id, po.id, coalesce(po.approved_at, po.created_at) as sent_at,
+           (select min(gr.received_at) from public.goods_receipts gr where gr.purchase_order_id = po.id and not gr.is_historical) as first_in,
+           (select sum(qty) from public.purchase_items where purchase_id = po.id) as ordered,
+           (select sum(qty_received) from public.purchase_items where purchase_id = po.id) as received,
+           (select sum(qty_returned) from public.purchase_items where purchase_id = po.id) as returned
+      from public.purchase_orders po
+     where po.status::text in ('ordered', 'partially_received', 'received', 'closed')
+       and coalesce(po.approved_at, po.created_at) >= now() - interval '365 days'
+  ),
+  adh as (
+    select i.supplier_id, avg(abs(l.unit_cost - l.po_unit_cost) / nullif(l.po_unit_cost, 0) * 100) as dev
+      from public.supplier_invoice_items l join public.supplier_invoices i on i.id = l.invoice_id
+     where i.status in ('posted', 'partially_paid', 'paid') and l.po_unit_cost is not null and i.invoice_date >= current_date - 365
+     group by 1
+  )
+  select po.supplier_id,
+         round(avg(extract(epoch from po.first_in - po.sent_at) / 86400) filter (where po.first_in is not null), 1),
+         round(sum(po.received)::numeric / nullif(sum(po.ordered) filter (where po.first_in is not null or po.received > 0), 0), 3),
+         round(coalesce(sum(po.returned), 0)::numeric / nullif(sum(po.received), 0), 3),
+         round(max(a.dev), 2),
+         count(*)::integer, count(po.first_in)::integer
+    from po left join adh a on a.supplier_id = po.supplier_id
+   group by po.supplier_id
+$$;
+
+-- ---------------------------------------------------------------------
+-- تقييم المرشحين لكل صنف
+-- ---------------------------------------------------------------------
+create or replace function public.supplier_scores(p_variants uuid[])
+returns table (variant_id uuid, supplier_id uuid, supplier_name text, cost numeric, cost_basis text, cost_points integer,
+               last_cost numeric, last_date date, lead_days numeric, fill_rate numeric, return_rate numeric,
+               score numeric, rank integer, sufficient boolean, why jsonb)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  st public.store_settings;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  select * into st from public.store_settings where id = 1;
+  return query
+  with vv as (
+    select v.id as variant_id, v.product_id from public.product_variants v where v.id = any(p_variants)
+  ),
+  pts as (select * from public._supplier_price_points() where invoice_date >= current_date - 180),
+  cand as (
+    select distinct vv.variant_id, x.supplier_id from vv
+      join lateral (
+        select p.supplier_id from public._supplier_price_points() p
+         where p.invoice_date >= current_date - 365 and (p.variant_id = vv.variant_id or p.product_id = vv.product_id)
+        union
+        select si.supplier_id from public.supplier_items si where si.variant_id = vv.variant_id
+      ) x on true
+  ),
+  base as (
+    select c.variant_id, c.supplier_id, s.name,
+           -- التكلفة الواصلة: متوسط مرجّح للصنف نفسه (180 يوماً) ← ثم الموديل ← ثم السعر المتفق عليه
+           coalesce(
+             (select round(sum(p.landed_unit * p.qty) / sum(p.qty), 2) from pts p where p.supplier_id = c.supplier_id and p.variant_id = c.variant_id),
+             (select round(sum(p.landed_unit * p.qty) / sum(p.qty), 2) from pts p join vv on vv.variant_id = c.variant_id
+               where p.supplier_id = c.supplier_id and p.product_id = vv.product_id),
+             (select si.agreed_cost from public.supplier_items si where si.supplier_id = c.supplier_id and si.variant_id = c.variant_id)) as cost,
+           case when exists (select 1 from pts p where p.supplier_id = c.supplier_id and p.variant_id = c.variant_id) then 'variant'
+                when exists (select 1 from pts p join vv on vv.variant_id = c.variant_id where p.supplier_id = c.supplier_id and p.product_id = vv.product_id) then 'model'
+                when exists (select 1 from public.supplier_items si where si.supplier_id = c.supplier_id and si.variant_id = c.variant_id and si.agreed_cost is not null) then 'agreed'
+                else 'none' end as basis,
+           (select count(*)::integer from pts p where p.supplier_id = c.supplier_id and p.variant_id = c.variant_id) as npts,
+           (select p.landed_unit from public._supplier_price_points() p where p.supplier_id = c.supplier_id and p.variant_id = c.variant_id
+             order by p.seq desc limit 1) as last_cost,
+           (select max(p.invoice_date) from public._supplier_price_points() p where p.supplier_id = c.supplier_id and p.variant_id = c.variant_id) as last_date,
+           coalesce(pf.lead_days, (select si.lead_time_days from public.supplier_items si where si.supplier_id = c.supplier_id and si.variant_id = c.variant_id),
+                    s.lead_time_days) as lead,
+           coalesce(pf.fill_rate, 1) as fill, coalesce(pf.return_rate, 0) as ret,
+           exists (select 1 from public._supplier_price_points() p join vv on vv.variant_id = c.variant_id
+                    where p.supplier_id = c.supplier_id and (p.variant_id = c.variant_id or p.product_id = vv.product_id)) as sufficient
+      from cand c
+      join public.suppliers s on s.id = c.supplier_id and s.is_active
+      left join public._supplier_performance() pf on pf.supplier_id = c.supplier_id
+  ),
+  mins as (
+    select variant_id, min(cost) filter (where cost > 0) as min_cost, min(lead) filter (where lead is not null) as min_lead
+      from base where sufficient group by 1
+  ),
+  scored as (
+    select b.*,
+           round(st.supplier_weight_price * coalesce(m.min_cost / nullif(b.cost, 0), 0)
+               + st.supplier_weight_lead * case when b.lead is null then 0.5 when b.lead <= 0 or m.min_lead <= 0 then 1
+                                                else least(m.min_lead / b.lead, 1) end
+               + st.supplier_weight_fill * least(b.fill, 1)
+               + st.supplier_weight_quality * greatest(1 - b.ret, 0), 1) as sc
+      from base b left join mins m on m.variant_id = b.variant_id
+  )
+  select s.variant_id, s.supplier_id, s.name, s.cost, s.basis, s.npts, s.last_cost, s.last_date, s.lead, s.fill, s.ret,
+         case when s.sufficient then s.sc end,
+         case when s.sufficient then (rank() over (partition by s.variant_id, s.sufficient order by s.sc desc, s.cost asc nulls last))::integer end,
+         s.sufficient,
+         jsonb_build_object('cost', s.cost, 'cost_basis', s.basis, 'price_points', s.npts, 'last_cost', s.last_cost,
+                            'lead_days', s.lead, 'fill_rate', s.fill, 'return_rate', s.ret,
+                            'weights', jsonb_build_object('price', st.supplier_weight_price, 'lead', st.supplier_weight_lead,
+                                                          'fill', st.supplier_weight_fill, 'quality', st.supplier_weight_quality))
+    from scored s
+   order by s.variant_id, s.sufficient desc, s.sc desc nulls last;
+end;
+$$;
+
+-- الأنسب لكل صنف + «لماذا؟» مقارنةً بالبديل الأفضل التالي
+create or replace function public.suggest_suppliers(p_variants uuid[])
+returns table (variant_id uuid, supplier_id uuid, supplier_name text, cost numeric, lead_days numeric, fill_rate numeric,
+               score numeric, reason text, alternatives jsonb)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with s as (select * from public.supplier_scores(p_variants)),
+  best as (select * from s where rank = 1),
+  second as (select distinct on (variant_id) * from s where sufficient and rank > 1 order by variant_id, rank, cost)
+  select b.variant_id, b.supplier_id, b.supplier_name, b.cost, b.lead_days, b.fill_rate, b.score,
+         format('«%s»: %s ر.س للقطعة واصلة (%s)، يورّد خلال %s، ويسلّم %s%% من المطلوب، مرتجعاته %s%%.%s',
+                b.supplier_name, b.cost,
+                case b.cost_basis when 'variant' then format('متوسط %s فاتورة خلال 180 يوماً', b.cost_points)
+                                  when 'model' then 'من أسعار نفس الموديل' else 'السعر المتفق عليه' end,
+                coalesce(b.lead_days::text || ' يوم', 'مدة غير معروفة'),
+                round(coalesce(b.fill_rate, 1) * 100), round(coalesce(b.return_rate, 0) * 100, 1),
+                case when n.supplier_id is null then ' لا يوجد مورد بديل ببيانات كافية.'
+                     else format(' مقارنةً بـ«%s»: %s ر.س (%s%s%%)%s — التقييم %s مقابل %s.',
+                                 n.supplier_name, n.cost,
+                                 case when n.cost >= b.cost then '+' else '' end,
+                                 round((n.cost - b.cost) / nullif(b.cost, 0) * 100, 1),
+                                 case when n.lead_days is not null and b.lead_days is not null and n.lead_days < b.lead_days
+                                      then format(' رغم أنه أسرع بـ%s يوم', b.lead_days - n.lead_days) else '' end,
+                                 b.score, n.score) end),
+         coalesce((select jsonb_agg(jsonb_build_object('supplier_id', x.supplier_id, 'name', x.supplier_name, 'cost', x.cost,
+                                                       'lead_days', x.lead_days, 'score', x.score, 'sufficient', x.sufficient) order by x.sufficient desc, x.score desc nulls last)
+                     from s x where x.variant_id = b.variant_id and x.supplier_id <> b.supplier_id), '[]'::jsonb)
+    from best b left join second n on n.variant_id = b.variant_id;
+end;
+$$;
+
+create or replace function public.supplier_price_comparison(p_product uuid)
+returns table (variant_id uuid, sku text, size text, color text, supplier_id uuid, supplier_name text,
+               last_cost numeric, avg_landed_180 numeric, last_date date, is_best boolean)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return query
+  with p as (select * from public._supplier_price_points() where product_id = p_product),
+  agg as (
+    select p.variant_id, p.supplier_id,
+           (array_agg(p.landed_unit order by p.seq desc))[1] as last_cost,
+           round(sum(p.landed_unit * p.qty) filter (where p.invoice_date >= current_date - 180)
+                 / nullif(sum(p.qty) filter (where p.invoice_date >= current_date - 180), 0), 2) as avg180,
+           max(p.invoice_date) as last_date
+      from p group by 1, 2
+  )
+  select a.variant_id, v.sku, v.size, v.color, a.supplier_id, s.name, a.last_cost, a.avg180, a.last_date,
+         a.last_cost = min(a.last_cost) over (partition by a.variant_id)
+    from agg a join public.product_variants v on v.id = a.variant_id join public.suppliers s on s.id = a.supplier_id
+   order by v.sku, a.last_cost;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- مسودات الشراء من التوصيات: تجميع حسب المورد (المحدد أو المقترح) وموقع الاستلام
+--   p_lines: [{variant_id, location_id, qty, supplier_id?}]
+-- ---------------------------------------------------------------------
+create or replace function public.create_purchase_drafts_by_supplier(p_lines jsonb, p_notes text default null, p_client_ref uuid default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_out jsonb := '[]';
+  g record;
+  v_ref uuid;
+  v_id uuid;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'لا توجد أصناف';
+  end if;
+  create temp table if not exists _pd (variant_id uuid, location_id uuid, qty integer, supplier_id uuid) on commit drop;
+  truncate _pd;
+  insert into _pd
+  select (e ->> 'variant_id')::uuid, (e ->> 'location_id')::uuid, (e ->> 'qty')::integer, (e ->> 'supplier_id')::uuid
+    from jsonb_array_elements(p_lines) e;
+  if exists (select 1 from _pd where qty is null or qty <= 0 or location_id is null) then
+    raise exception 'كل سطر يحتاج كمية وموقع استلام';
+  end if;
+  update _pd set supplier_id = s.supplier_id
+    from public.suggest_suppliers((select array_agg(distinct variant_id) from _pd where supplier_id is null)) s
+   where _pd.supplier_id is null and s.variant_id = _pd.variant_id;
+  if exists (select 1 from _pd where supplier_id is null) then
+    raise exception 'لا يوجد مورد مقترح لبعض الأصناف (%) — اختر المورد يدوياً',
+      (select string_agg(distinct v.sku, '، ') from _pd join public.product_variants v on v.id = _pd.variant_id where _pd.supplier_id is null);
+  end if;
+
+  for g in select supplier_id, location_id, jsonb_agg(jsonb_build_object('variant_id', variant_id, 'qty', qty)) as items
+             from _pd group by 1, 2 order by 1, 2 loop
+    v_ref := case when p_client_ref is null then null else md5(p_client_ref::text || g.supplier_id::text || g.location_id::text)::uuid end;
+    if v_ref is not null then
+      perform pg_advisory_xact_lock(hashtextextended('pd:' || v_ref::text, 0));
+      select id into v_id from public.purchase_orders where client_ref = v_ref;
+    else
+      v_id := null;
+    end if;
+    if v_id is null then
+      v_id := public.create_purchase_draft_at(g.supplier_id, g.location_id, g.items, coalesce(p_notes, 'مسودة من مركز القرارات'));
+      update public.purchase_orders set client_ref = v_ref where id = v_id;
+    end if;
+    v_out := v_out || jsonb_build_object('id', v_id, 'po_no', (select po_no from public.purchase_orders where id = v_id),
+                                         'supplier_id', g.supplier_id, 'location_id', g.location_id);
+  end loop;
+  return v_out;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- لوحة المشتريات والمستحقات
+-- ---------------------------------------------------------------------
+create or replace function public.purchasing_dashboard()
+returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_today date := (now() at time zone 'Asia/Riyadh')::date;
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  return jsonb_build_object(
+    'due_this_week', coalesce((select sum(total - settled_amount) from public.supplier_invoices
+                                where status in ('posted', 'partially_paid') and coalesce(due_date, invoice_date) between v_today and v_today + 7), 0),
+    'overdue', (select jsonb_build_object('d1_30', coalesce(sum(d1_30), 0), 'd31_60', coalesce(sum(d31_60), 0),
+                                          'd61_90', coalesce(sum(d61_90), 0), 'd90_plus', coalesce(sum(d90_plus), 0),
+                                          'total', coalesce(sum(d1_30 + d31_60 + d61_90 + d90_plus), 0),
+                                          'not_due', coalesce(sum(not_due), 0), 'open', coalesce(sum(total_open), 0))
+                  from public.supplier_aging(v_today)),
+    'top_creditors', coalesce((select jsonb_agg(x) from (
+                        select supplier_id, supplier_name, total_open, d1_30 + d31_60 + d61_90 + d90_plus as overdue, credit_limit
+                          from public.supplier_aging(v_today) where total_open > 0 order by total_open desc limit 10) x), '[]'),
+    'unapplied_credits', coalesce((select sum(unapplied) from public.supplier_aging(v_today)), 0),
+    -- مستلم غير مفوتر (التزام لم تصل فاتورته)
+    'received_not_invoiced', (select jsonb_build_object(
+                                'value', coalesce(sum((gi.qty - gi.qty_invoiced - gi.qty_returned) * gi.unit_cost), 0),
+                                'lines', count(*), 'oldest_days', coalesce(max(v_today - (gr.received_at at time zone 'Asia/Riyadh')::date), 0))
+                                from public.goods_receipt_items gi join public.goods_receipts gr on gr.id = gi.receipt_id
+                               where not gr.is_historical and gi.qty > gi.qty_invoiced + gi.qty_returned),
+    'draft_invoices', (select count(*) from public.supplier_invoices where status = 'draft'),
+    'purchases_by_month', coalesce((select jsonb_agg(x order by x.month) from (
+                              select to_char(date_trunc('month', invoice_date), 'YYYY-MM') as month, sum(subtotal) as subtotal, sum(vat_amount) as vat
+                                from public.supplier_invoices
+                               where status in ('posted', 'partially_paid', 'paid') and kind <> 'opening' and invoice_date >= date_trunc('month', v_today) - interval '11 months'
+                               group by 1) x), '[]'),
+    'purchases_by_supplier', coalesce((select jsonb_agg(x) from (
+                                 select i.supplier_id, s.name, sum(i.subtotal) as subtotal from public.supplier_invoices i join public.suppliers s on s.id = i.supplier_id
+                                  where i.status in ('posted', 'partially_paid', 'paid') and i.kind <> 'opening' and i.invoice_date >= v_today - 90
+                                  group by 1, 2 order by 3 desc limit 10) x), '[]'),
+    'input_vat_this_month', coalesce((select sum(vat_amount) from public.supplier_invoices
+                                       where status in ('posted', 'partially_paid', 'paid') and invoice_date >= date_trunc('month', v_today)), 0)
+                          - coalesce((select sum(vat_amount) from public.supplier_credit_notes
+                                       where status = 'posted' and credit_date >= date_trunc('month', v_today)), 0),
+    'cost_variance_this_month', coalesce((select sum(variance_delta) from public.cost_adjustments
+                                           where posted_at >= date_trunc('month', now() at time zone 'Asia/Riyadh') at time zone 'Asia/Riyadh'), 0),
+    'price_alerts', coalesce((select jsonb_agg(x) from (
+                        select h.supplier_name, h.sku, h.unit_cost, h.change_pct, h.invoice_date
+                          from public.supplier_price_history(null, null, 60) h where h.change_pct >= 10
+                         order by h.change_pct desc limit 10) x), '[]'),
+    'late_orders', coalesce((select jsonb_agg(x) from (
+                       select po.id, po.po_no, s.name as supplier_name, po.expected_at, v_today - po.expected_at as days_late
+                         from public.purchase_orders po join public.suppliers s on s.id = po.supplier_id
+                        where po.status::text in ('ordered', 'partially_received') and po.expected_at < v_today
+                        order by po.expected_at limit 20) x), '[]')
+  );
+end;
+$$;
+
+create or replace function public.purchase_advisor(
+  p_lead_days integer default 7,
+  p_cover_days integer default 30,
+  p_safety_days integer default 7
+)
+returns table (
+  variant_id uuid,
+  product_id uuid,
+  product_name text,
+  category_name text,
+  size text,
+  color text,
+  sku text,
+  barcode text,
+  is_active boolean,
+  stock integer,
+  on_order integer,
+  unit_cost numeric,
+  unit_price numeric,
+  sold_7 integer,
+  sold_30 integer,
+  sold_90 integer,
+  age_days integer,
+  avg_daily numeric,
+  cover_days numeric,
+  reorder_point integer,
+  target_qty integer,
+  suggested_qty integer,
+  last_sale_at timestamptz,
+  idle_days integer,
+  supplier_id uuid,
+  supplier_name text
+)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not public.is_manager() then
+    raise exception 'غير مصرح';
+  end if;
+  if p_lead_days < 0 or p_cover_days < 1 or p_safety_days < 0
+     or p_lead_days > 365 or p_cover_days > 365 or p_safety_days > 365 then
+    raise exception 'قيم غير صحيحة: مدة التوريد والأمان 0–365، والتغطية 1–365 يوماً';
+  end if;
+
+  return query
+  with sold as (
+    select si.variant_id,
+           sum(si.qty) filter (where s.created_at >= now() - interval '7 days')  as q7,
+           sum(si.qty) filter (where s.created_at >= now() - interval '30 days') as q30,
+           sum(si.qty) as q90
+      from public.sale_items si
+      join public.sales s on s.id = si.sale_id
+     where s.created_at >= now() - interval '90 days'
+     group by si.variant_id
+  ),
+  returned as (
+    select ri.variant_id,
+           sum(ri.qty) filter (where r.created_at >= now() - interval '7 days')  as q7,
+           sum(ri.qty) filter (where r.created_at >= now() - interval '30 days') as q30,
+           sum(ri.qty) as q90
+      from public.return_items ri
+      join public.returns r on r.id = ri.return_id
+     where r.created_at >= now() - interval '90 days'
+     group by ri.variant_id
+  ),
+  last_sale as (
+    select si.variant_id, max(s.created_at) as at
+      from public.sale_items si
+      join public.sales s on s.id = si.sale_id
+     group by si.variant_id
+  ),
+  -- المتبقي فقط من المسودة والمرسل والمستلم جزئياً (بعد 0018)
+  open_po as (
+    select o.variant_id, sum(o.qty)::integer as qty from public._open_po_qty() o group by o.variant_id
+  ),
+  last_supplier as (
+    select distinct on (pi.variant_id) pi.variant_id, po.supplier_id
+      from public.purchase_items pi
+      join public.purchase_orders po on po.id = pi.purchase_id
+     where po.status <> 'cancelled'
+     order by pi.variant_id, coalesce(po.received_at, po.created_at) desc
+  ),
+  base as (
+    select v.id, v.product_id, p.name as pname, c.name as cname, v.size, v.color, v.sku, v.barcode,
+           (v.is_active and p.is_active) as active,
+           v.stock_qty,
+           coalesce(o.qty, 0) as on_order,
+           coalesce(vc.cost_price, 0) as cost,
+           coalesce(v.price, p.base_price) as price,
+           greatest(coalesce(sd.q7, 0) - coalesce(rt.q7, 0), 0)::integer as n7,
+           greatest(coalesce(sd.q30, 0) - coalesce(rt.q30, 0), 0)::integer as n30,
+           greatest(coalesce(sd.q90, 0) - coalesce(rt.q90, 0), 0)::integer as n90,
+           greatest(ceil(extract(epoch from now() - v.created_at) / 86400), 1)::integer as age,
+           ls.at as last_at,
+           lsu.supplier_id
+      from public.product_variants v
+      join public.products p on p.id = v.product_id
+      left join public.categories c on c.id = p.category_id
+      left join public.variant_costs vc on vc.variant_id = v.id
+      left join sold sd on sd.variant_id = v.id
+      left join returned rt on rt.variant_id = v.id
+      left join last_sale ls on ls.variant_id = v.id
+      left join open_po o on o.variant_id = v.id
+      left join last_supplier lsu on lsu.variant_id = v.id
+     where (v.is_active and p.is_active) or v.stock_qty <> 0
+  ),
+  rated as (
+    select b.*,
+           round(
+             0.2 * b.n7 / least(7, b.age)::numeric
+           + 0.5 * b.n30 / least(30, b.age)::numeric
+           + 0.3 * b.n90 / least(90, b.age)::numeric, 3) as avg_d
+      from base b
+  ),
+  planned as (
+    select r.*,
+           ceil(r.avg_d * (p_lead_days + p_safety_days))::integer as rop,
+           ceil(r.avg_d * (p_lead_days + p_safety_days + p_cover_days))::integer as target
+      from rated r
+  )
+  select pl.id, pl.product_id, pl.pname, pl.cname, pl.size, pl.color, pl.sku, pl.barcode, pl.active,
+         pl.stock_qty, pl.on_order, pl.cost, pl.price,
+         pl.n7, pl.n30, pl.n90, pl.age,
+         pl.avg_d,
+         case when pl.avg_d > 0 then round(greatest(pl.stock_qty, 0) / pl.avg_d, 1) end,
+         pl.rop,
+         pl.target,
+         case
+           when pl.active and pl.avg_d > 0 and greatest(pl.stock_qty, 0) + pl.on_order <= pl.rop
+             then greatest(pl.target - greatest(pl.stock_qty, 0) - pl.on_order, 0)
+           else 0
+         end,
+         pl.last_at,
+         greatest(floor(extract(epoch from now() - coalesce(pl.last_at, (
+           -- لم يُبع أبداً: منذ دخوله المخزون (أول حركة) أو إنشائه
+           select min(m.created_at) from public.stock_movements m where m.variant_id = pl.id and m.qty_change > 0
+         ), (select v2.created_at from public.product_variants v2 where v2.id = pl.id))) / 86400), 0)::integer,
+         pl.supplier_id,
+         su.name
+    from planned pl
+    left join public.suppliers su on su.id = pl.supplier_id
+   order by pl.pname, pl.size nulls first, pl.color nulls first;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- الصلاحيات
+-- ---------------------------------------------------------------------
+alter table public.supplier_items enable row level security;
+revoke all on public.supplier_items from anon;
+grant select, insert, update, delete on public.supplier_items to authenticated;
+create policy supplier_items_select on public.supplier_items for select to authenticated using (public.is_manager());
+create policy supplier_items_write on public.supplier_items for all to authenticated
+  using (public.is_manager()) with check (public.is_manager());
+create trigger supplier_items_audit after insert or update or delete on public.supplier_items
+  for each row execute function public.audit_trigger();
+
+revoke all on function public._supplier_price_points(), public._supplier_performance() from public, anon, authenticated;
+revoke execute on function
+  public.supplier_price_history(uuid, uuid, integer), public.supplier_scores(uuid[]), public.suggest_suppliers(uuid[]),
+  public.supplier_price_comparison(uuid), public.create_purchase_drafts_by_supplier(jsonb, text, uuid),
+  public.purchasing_dashboard()
+from public, anon;
+grant execute on function
+  public.supplier_price_history(uuid, uuid, integer), public.supplier_scores(uuid[]), public.suggest_suppliers(uuid[]),
+  public.supplier_price_comparison(uuid), public.create_purchase_drafts_by_supplier(jsonb, text, uuid),
+  public.purchasing_dashboard()
 to authenticated;
 
 commit;
