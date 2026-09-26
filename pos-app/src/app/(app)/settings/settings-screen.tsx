@@ -43,6 +43,11 @@ export function SettingsScreen() {
         allow_cashier_returns: s.allow_cashier_returns,
         require_shift: s.require_shift,
         inventory_segregation: !!s.inventory_segregation,
+        purchase_match_tolerance_pct: Number(s.purchase_match_tolerance_pct ?? 2),
+        supplier_weight_price: Number(s.supplier_weight_price ?? 50),
+        supplier_weight_lead: Number(s.supplier_weight_lead ?? 20),
+        supplier_weight_fill: Number(s.supplier_weight_fill ?? 15),
+        supplier_weight_quality: Number(s.supplier_weight_quality ?? 15),
         max_cashier_discount_pct: Number(s.max_cashier_discount_pct),
         return_days: Number(s.return_days),
       })
@@ -116,6 +121,30 @@ export function SettingsScreen() {
             checked={!!s.inventory_segregation}
             onChange={(v) => set("inventory_segregation", v)}
           />
+          <div className="rounded-lg border border-slate-200 p-3">
+            <p className="mb-2 text-sm font-medium text-slate-800">المشتريات والموردون</p>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+              <Field label="سماح فرق السعر في المطابقة %">
+                <Input type="number" min={0} max={50} step="0.5" value={s.purchase_match_tolerance_pct ?? 2}
+                  onChange={(e) => set("purchase_match_tolerance_pct", Number(e.target.value))} />
+              </Field>
+              <Field label="وزن التكلفة %">
+                <Input type="number" min={0} max={100} value={s.supplier_weight_price ?? 50} onChange={(e) => set("supplier_weight_price", Number(e.target.value))} />
+              </Field>
+              <Field label="وزن مدة التوريد %">
+                <Input type="number" min={0} max={100} value={s.supplier_weight_lead ?? 20} onChange={(e) => set("supplier_weight_lead", Number(e.target.value))} />
+              </Field>
+              <Field label="وزن نسبة التوريد %">
+                <Input type="number" min={0} max={100} value={s.supplier_weight_fill ?? 15} onChange={(e) => set("supplier_weight_fill", Number(e.target.value))} />
+              </Field>
+              <Field label="وزن الجودة %">
+                <Input type="number" min={0} max={100} value={s.supplier_weight_quality ?? 15} onChange={(e) => set("supplier_weight_quality", Number(e.target.value))} />
+              </Field>
+            </div>
+            <p className="mt-2 text-xs text-slate-500">
+              أوزان اقتراح المورد مجموعها 100 (الحالي: {Number(s.supplier_weight_price ?? 50) + Number(s.supplier_weight_lead ?? 20) + Number(s.supplier_weight_fill ?? 15) + Number(s.supplier_weight_quality ?? 15)}).
+            </p>
+          </div>
           <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">
             تغيير نسبة الضريبة أو طريقة التسعير يؤثر على الفواتير الجديدة فقط. الفواتير السابقة تحتفظ بنسبتها.
           </p>

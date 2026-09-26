@@ -82,7 +82,7 @@ export function PurchaseDocuments({ po, onChange }: { po: PurchaseOrder; onChang
 
   return (
     <div className="mt-4 grid gap-4 lg:grid-cols-3">
-      <div className="space-y-4 lg:col-span-2">
+      <div className="min-w-0 space-y-4 lg:col-span-2">
         {canReceive && remaining > 0 && (
           <Card>
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 p-3">

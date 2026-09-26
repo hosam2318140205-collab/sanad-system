@@ -6,6 +6,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { Badge, Button, Card, EmptyState, Field, Input, Loading, Modal, PageHeader, Select, Stat, Table, cn, useToast } from "@/components/ui";
 import { errorMessage, money, num } from "@/lib/format";
 import { DECISION_ACTIONS, fetchLocations, n, newRef, rpcAll, type Decision, type DecisionAction, type Location } from "@/lib/inventory";
+import type { SupplierSuggestion } from "@/lib/purchasing";
 import { supabase } from "@/lib/supabase/client";
 import type { Supplier } from "@/lib/types";
 
@@ -345,69 +346,95 @@ export function DecisionCenter() {
 
 function DraftDialog({ orders, suppliers, onClose, onDone }: { orders: Decision[]; suppliers: Supplier[]; onClose: () => void; onDone: () => void }) {
   const toast = useToast();
-  const groups = useMemo(() => {
-    const m = new Map<string, { name: string; lines: Decision[] }>();
-    for (const d of orders) {
-      const k = d.to_location ?? "";
-      if (!m.has(k)) m.set(k, { name: d.to_name ?? "", lines: [] });
-      m.get(k)!.lines.push(d);
-    }
-    return [...m];
-  }, [orders]);
-  const [supplier, setSupplier] = useState<Record<string, string>>({});
+  const [sugg, setSugg] = useState<Record<string, SupplierSuggestion>>({});
+  const [choice, setChoice] = useState<Record<string, string>>({});
+  const [why, setWhy] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const ref = useRef(newRef());
+  const lineKey = (d: Decision) => `${d.variant_id}|${d.to_location}`;
+
+  useEffect(() => {
+    supabase()
+      .rpc("suggest_suppliers", { p_variants: [...new Set(orders.map((d) => d.variant_id))] })
+      .then(({ data }) => {
+        const map = Object.fromEntries(((data ?? []) as SupplierSuggestion[]).map((x) => [x.variant_id, x]));
+        setSugg(map);
+        setChoice(Object.fromEntries(orders.map((d) => [lineKey(d), map[d.variant_id]?.supplier_id ?? ""])));
+        setLoading(false);
+      });
+  }, [orders]);
 
   const create = async () => {
-    if (groups.some(([k]) => !supplier[k])) return toast("اختر المورد لكل موقع", "error");
+    if (orders.some((d) => !choice[lineKey(d)])) return toast("اختر المورد لكل صنف (لا يوجد مقترح لبعضها)", "error");
     setBusy(true);
-    try {
-      for (const [k, g] of groups) {
-        const { error } = await supabase().rpc("create_purchase_draft_at", {
-          p_supplier_id: supplier[k],
-          p_location: k,
-          p_items: g.lines.map((d) => ({ variant_id: d.variant_id, qty: d.qty })),
-        });
-        if (error) throw error;
-      }
-      toast(`تم إنشاء ${groups.length} مسودة شراء — راجعها من المشتريات`);
-      onDone();
-    } catch (e) {
-      toast(errorMessage(e), "error");
-    } finally {
-      setBusy(false);
-    }
+    const { data, error } = await supabase().rpc("create_purchase_drafts_by_supplier", {
+      p_lines: orders.map((d) => ({ variant_id: d.variant_id, location_id: d.to_location, qty: d.qty, supplier_id: choice[lineKey(d)] })),
+      p_notes: "مسودة من مركز القرارات",
+      p_client_ref: ref.current,
+    });
+    setBusy(false);
+    if (error) return toast(errorMessage(error), "error");
+    const list = (data ?? []) as Array<{ po_no: string }>;
+    toast(`تم إنشاء ${list.length} مسودة شراء: ${list.map((x) => x.po_no).join("، ")}`);
+    onDone();
   };
 
   return (
-    <Modal
-      open
-      onClose={onClose}
-      title="مسودات شراء حسب موقع الاستلام"
-      size="md"
-      footer={
-        <Button onClick={create} loading={busy}>
-          إنشاء المسودات
-        </Button>
-      }
-    >
-      <div className="space-y-4">
-        {groups.map(([k, g]) => (
-          <div key={k} className="rounded-lg border border-slate-200 p-3">
-            <p className="mb-2 font-medium">
-              {g.name} — {num(g.lines.reduce((s, d) => s + d.qty, 0))} قطعة · {money(g.lines.reduce((s, d) => s + d.cost_value, 0))}
-            </p>
-            <Select aria-label={`مورد ${g.name}`} value={supplier[k] ?? ""} onChange={(e) => setSupplier((s) => ({ ...s, [k]: e.target.value }))}>
-              <option value="">اختر المورد</option>
-              {suppliers.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </Select>
-          </div>
-        ))}
-        <p className="text-xs text-slate-500">تُنشأ كمسودات فقط. الاستلام يضيف المخزون إلى الموقع المحدد في أمر الشراء.</p>
-      </div>
+    <Modal open onClose={onClose} title="مسودات شراء — المورد الأنسب لكل صنف" size="lg"
+      footer={<Button onClick={create} loading={busy} disabled={loading}>إنشاء المسودات</Button>}>
+      {loading ? (
+        <Loading label="جاري تقييم الموردين..." />
+      ) : (
+        <div className="space-y-2">
+          {orders.map((d) => {
+            const k = lineKey(d);
+            const sg = sugg[d.variant_id];
+            return (
+              <div key={k} className="rounded-lg border border-slate-200 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="font-medium">{d.product_name} {d.variant_label ?? ""}</p>
+                    <p className="text-xs text-slate-500">{num(d.qty)} قطعة إلى {d.to_name}</p>
+                  </div>
+                  <Select aria-label={`مورد ${d.sku}`} className="w-auto min-w-44" value={choice[k] ?? ""}
+                    onChange={(e) => setChoice((c) => ({ ...c, [k]: e.target.value }))}>
+                    <option value="">اختر المورد</option>
+                    {suppliers.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}{sg?.supplier_id === s.id ? " (المقترح)" : ""}
+                      </option>
+                    ))}
+                  </Select>
+                  {sg && (
+                    <Button size="sm" variant="ghost" onClick={() => setWhy(why === k ? null : k)}>
+                      <HelpCircle className="size-4" /> لماذا؟
+                    </Button>
+                  )}
+                </div>
+                {!sg && <p className="mt-1 text-xs text-amber-700">لا توجد مشتريات سابقة لهذا الموديل — اختر المورد يدوياً.</p>}
+                {why === k && sg && (
+                  <div className="mt-2 rounded-lg bg-slate-50 p-2 text-xs leading-relaxed text-slate-700">
+                    <p>{sg.reason}</p>
+                    {sg.alternatives.length > 0 && (
+                      <ul className="mt-1 space-y-0.5 text-slate-500">
+                        {sg.alternatives.map((a) => (
+                          <li key={a.supplier_id}>
+                            {a.name}: {a.sufficient ? `${a.cost ?? "-"} ر.س · ${a.lead_days ?? "-"} يوم · التقييم ${a.score}` : "بيانات غير كافية"}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <p className="text-xs text-slate-500">
+            التقييم: التكلفة الواصلة، مدة التوريد الفعلية، نسبة التوريد، والجودة (المرتجعات). المسودات تُجمَّع لكل مورد وموقع استلام، والنقل الداخلي مقدَّم دائماً.
+          </p>
+        </div>
+      )}
     </Modal>
   );
 }

@@ -55,6 +55,7 @@ import {
   round2,
   variantLabel,
 } from "@/lib/format";
+import type { SupplierSuggestion } from "@/lib/purchasing";
 import { supabase } from "@/lib/supabase/client";
 import type { Supplier } from "@/lib/types";
 
@@ -111,6 +112,9 @@ export function AdvisorScreen() {
     {},
   );
   const [creating, setCreating] = useState(false);
+  // المورد الأنسب لكل صنف (0020) مع «لماذا؟»
+  const [advice, setAdvice] = useState<Record<string, SupplierSuggestion>>({});
+  const [adviceOpen, setAdviceOpen] = useState<string | null>(null);
 
   const run = async (p: AdvisorParams) => {
     try {
@@ -326,6 +330,19 @@ export function AdvisorScreen() {
       ),
     );
     setDraftOpen(true);
+    supabase()
+      .rpc("suggest_suppliers", { p_variants: selectedRows.map((r) => r.variant_id) })
+      .then(({ data }) => {
+        const map = Object.fromEntries(
+          ((data ?? []) as SupplierSuggestion[]).map((x) => [x.variant_id, x]),
+        );
+        setAdvice(map);
+        // أصناف بلا مورد سابق: المقترح إن اتفقت أصناف المجموعة عليه
+        const none = groups.find((g) => g.key === NO_SUPPLIER);
+        const ids = new Set(none?.rows.map((r) => map[r.variant_id]?.supplier_id));
+        if (none && ids.size === 1 && [...ids][0])
+          setGroupSupplier((gs) => ({ ...gs, [NO_SUPPLIER]: [...ids][0] as string }));
+      });
   };
 
   const createDrafts = async () => {
@@ -1121,6 +1138,19 @@ export function AdvisorScreen() {
                       ))}
                     </Select>
                   </Field>
+                  {(() => {
+                    const first = g.rows.map((r) => advice[r.variant_id]).find(Boolean);
+                    if (!first) return null;
+                    return (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setAdviceOpen(adviceOpen === g.key ? null : g.key)}
+                      >
+                        <HelpCircle className="size-4" /> المقترح: {first.supplier_name}
+                      </Button>
+                    );
+                  })()}
                   <p className="pb-2 text-sm text-slate-600">
                     {num(g.rows.length)} صنف · {num(units)} قطعة ·{" "}
                     <span className="font-semibold text-slate-900">
@@ -1128,6 +1158,15 @@ export function AdvisorScreen() {
                     </span>
                   </p>
                 </div>
+                {adviceOpen === g.key && (
+                  <ul className="mt-2 space-y-1 rounded-lg bg-slate-50 p-2 text-xs leading-relaxed text-slate-700">
+                    {g.rows.filter((r) => advice[r.variant_id]).map((r) => (
+                      <li key={r.variant_id}>
+                        <b>{r.sku}:</b> {advice[r.variant_id].reason}
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 <ul className="mt-2 max-h-32 overflow-y-auto text-xs text-slate-500 scrollbar-thin">
                   {g.rows.map((r) => (
                     <li

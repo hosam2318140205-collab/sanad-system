@@ -308,7 +308,7 @@ export function InvoiceEditor({ id, poId, supplierId }: { id: string | null; poI
           </div>
         </Card>
 
-        <div className="space-y-4 lg:col-span-2">
+        <div className="min-w-0 space-y-4 lg:col-span-2">
           {stock.length > 0 && (
             <Card>
               <div className="border-b border-slate-100 p-3">
